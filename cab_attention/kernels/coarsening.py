@@ -13,10 +13,12 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_D': 32}),
-        triton.Config({'BLOCK_D': 64}),
-        triton.Config({'BLOCK_D': 128}),
-        triton.Config({'BLOCK_D': 256}),
+        triton.Config({'BLOCK_D': 32}, num_warps=4),
+        triton.Config({'BLOCK_D': 64}, num_warps=4),
+        triton.Config({'BLOCK_D': 64}, num_warps=8),
+        triton.Config({'BLOCK_D': 128}, num_warps=4),
+        triton.Config({'BLOCK_D': 128}, num_warps=8),
+        triton.Config({'BLOCK_D': 256}, num_warps=8),
     ],
     key=['N', 'D', 'BLOCK_SIZE'],
 )

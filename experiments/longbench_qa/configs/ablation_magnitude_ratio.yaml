@@ -1,0 +1,45 @@
+# Magnitude Ratio Ablation Study Configuration
+# =============================================
+# Tests different magnitude_ratio values for CAB V4 hybrid selection
+
+name: ablation_magnitude_ratio
+description: Magnitude ratio ablation for CAB V4 (0=pure FRC, 1=pure H2O)
+
+datasets:
+  - narrativeqa
+  - qasper
+
+# Each "method" here represents CAB V4 with different magnitude_ratio
+# This will be expanded in the driver to run multiple configurations
+methods:
+  - cab_v4  # Will be run with magnitude_ratio: 0.0, 0.25, 0.5, 0.75, 1.0
+
+# Custom parameter for this ablation
+magnitude_ratios:
+  - 0.0   # Pure FRC (CAB V3)
+  - 0.1
+  - 0.25
+  - 0.4
+  - 0.5   # Default (50/50)
+  - 0.6
+  - 0.75
+  - 0.9
+  - 1.0   # Pure magnitude (H2O equivalent)
+
+sparsity_levels:
+  - 0.9
+  - 0.95
+
+model:
+  name: meta-llama/Llama-2-7b-hf
+  torch_dtype: float16
+  max_length: 4096
+  max_new_tokens: 256
+
+max_samples: 100
+batch_size: 1
+seed: 42
+
+output_dir: results/ablation_magnitude_ratio
+save_predictions: true
+

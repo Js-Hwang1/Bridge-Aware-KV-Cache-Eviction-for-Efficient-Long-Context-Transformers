@@ -1,0 +1,35 @@
+# Quick Test Configuration for Perplexity Benchmark
+# Run: python -m experiments.perplexity_lm.driver --config experiments/perplexity_lm/configs/quick_test.yaml
+
+global_seed: 42
+global_output_dir: results/perplexity/quick_test
+
+experiments:
+  - name: quick_perplexity_test
+    description: Quick perplexity test for debugging
+    
+    model:
+      name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      max_length: 1024
+      torch_dtype: float16
+      use_flash_attention: true
+    
+    datasets:
+      - wikitext-2
+    
+    methods:
+      - dense
+      - cab_v4
+    
+    context_length_sweep:
+      enabled: true
+      context_lengths: [512, 1024]
+      fixed_sparsity: 0.9
+    
+    sparsity_sweep:
+      enabled: true
+      sparsity_levels: [0.0, 0.9]
+      fixed_context_length: 1024
+    
+    output_dir: results/perplexity/quick_test
+

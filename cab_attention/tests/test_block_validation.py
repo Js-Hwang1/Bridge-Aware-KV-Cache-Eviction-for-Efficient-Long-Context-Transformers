@@ -16,7 +16,7 @@ sys.path.append('..')
 from cab_attention.kernels.coarsening import coarsen_qk_max_l2_pytorch
 from cab_attention.kernels.frc_kernel import (
     compute_block_frc,
-    generate_block_mask_from_frc,
+    generate_block_mask,
     visualize_frc_statistics
 )
 
@@ -159,7 +159,7 @@ def run_block_level_experiment():
         success_h2o = mask_h2o[0, 0, bridge_i, bridge_j].item()
 
         # CAB: Keep low (negative) FRC
-        mask_frc = generate_block_mask_from_frc(
+        mask_frc = generate_block_mask(
             frc_scores,
             sparsity=sp,
             keep_diagonal=False,

@@ -1,0 +1,52 @@
+# InfiniteBench Configuration (128K+ Context)
+# ============================================
+# Extreme long-context evaluation for CAB-Attention
+
+name: infinitebench
+description: InfiniteBench 128K+ context evaluation
+
+datasets:
+  # Retrieval tasks (most important for CAB)
+  - passkey
+  - number_string
+  - kv_retrieval
+  
+  # QA tasks
+  - longbook_qa_eng
+  - longdialogue_qa_eng
+  
+  # Summarization
+  - longbook_sum_eng
+  
+  # Multiple choice
+  - longbook_choice_eng
+  
+  # Math/Code
+  - math_find
+  - code_debug
+
+methods:
+  - dense
+  - h2o
+  - cab_v4
+  - streaming_llm
+
+sparsity_levels:
+  - 0.95
+  - 0.99
+
+model:
+  name: meta-llama/Llama-2-7b-hf  # Or use a model with 128K context
+  torch_dtype: float16
+  max_length: 131072  # 128K
+  max_new_tokens: 256
+  use_flash_attention: true
+
+max_samples: 50  # InfiniteBench is expensive
+batch_size: 1
+seed: 42
+
+output_dir: results/infinitebench
+save_predictions: true
+save_attention_patterns: false  # Too large at 128K
+

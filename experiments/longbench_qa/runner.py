@@ -1,0 +1,896 @@
+"""
+Benchmark Runner for Long-Context QA Experiments
+
+Orchestrates the full evaluation pipeline:
+1. Load model and tokenizer
+2. Load datasets
+3. Apply sparse attention methods
+4. Generate predictions
+5. Compute metrics
+6. Aggregate and save results
+
+Designed for ICML-quality reproducible experiments.
+"""
+
+import os
+import json
+import time
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+
+# Optional dependencies with fallbacks
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        """Fallback tqdm that just returns the iterable."""
+        desc = kwargs.get('desc', '')
+        if desc:
+            print(f"Processing: {desc}...")
+        return iterable
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    import torch
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+    F = None
+
+from .config import (
+    ExperimentConfig,
+    DatasetConfig,
+    MethodConfig,
+    ModelConfig,
+    MetricName,
+    ALL_DATASETS,
+    METHOD_CONFIGS,
+)
+from .data_loaders import get_dataset, BenchmarkSample, BaseBenchmarkDataset
+from .methods import get_method, BaseAttentionMethod
+from .metrics import (
+    compute_metrics,
+    compute_batch_metrics,
+    EvaluationReport,
+    create_comparison_table,
+)
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Result Classes
+# =============================================================================
+
+@dataclass
+class SampleResult:
+    """Result for a single sample."""
+    sample_id: str
+    prediction: str
+    references: List[str]
+    metrics: Dict[str, float]
+    
+    # Optional diagnostics
+    attention_diagnostics: Optional[Dict[str, Any]] = None
+    generation_time_ms: float = 0.0
+    context_length: int = 0
+
+
+@dataclass
+class MethodResult:
+    """Results for a single method on a dataset."""
+    method_name: str
+    dataset_name: str
+    sparsity: float
+    
+    # Aggregated metrics
+    metrics: Dict[str, Dict[str, Any]]  # metric_name -> {mean, std, min, max}
+    
+    # Per-sample results
+    sample_results: List[SampleResult]
+    
+    # Timing
+    total_time_sec: float = 0.0
+    samples_per_sec: float = 0.0
+    
+    # Model info
+    model_name: str = ""
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            'method_name': self.method_name,
+            'dataset_name': self.dataset_name,
+            'sparsity': self.sparsity,
+            'metrics': self.metrics,
+            'sample_results': [asdict(s) for s in self.sample_results],
+            'total_time_sec': self.total_time_sec,
+            'samples_per_sec': self.samples_per_sec,
+            'model_name': self.model_name,
+        }
+
+
+@dataclass
+class ExperimentResult:
+    """Results for a complete experiment."""
+    name: str
+    description: str
+    
+    # Results per method
+    method_results: Dict[str, MethodResult]  # method_name -> MethodResult
+    
+    # Experiment config
+    config: Dict[str, Any]
+    
+    # Timing
+    start_time: str = ""
+    end_time: str = ""
+    total_time_sec: float = 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            'name': self.name,
+            'description': self.description,
+            'method_results': {k: v.to_dict() for k, v in self.method_results.items()},
+            'config': self.config,
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'total_time_sec': self.total_time_sec,
+        }
+
+
+# =============================================================================
+# Model Wrapper
+# =============================================================================
+
+class ModelWrapper:
+    """
+    Wrapper for LLM model with sparse attention integration.
+    
+    Handles:
+    - Model loading with memory optimization
+    - Tokenization
+    - Generation with attention modification
+    - Caching and batching
+    """
+    
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: str = None,
+    ):
+        self.config = config
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.model = None
+        self.tokenizer = None
+        self._loaded = False
+    
+    def load(self) -> None:
+        """Load model and tokenizer."""
+        if self._loaded:
+            return
+        
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError:
+            raise ImportError("transformers library required: pip install transformers")
+        
+        logger.info(f"Loading model: {self.config.name}")
+        
+        # Determine dtype
+        dtype_map = {
+            'float16': torch.float16,
+            'bfloat16': torch.bfloat16,
+            'float32': torch.float32,
+        }
+        torch_dtype = dtype_map.get(self.config.torch_dtype, torch.float16)
+        
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.name,
+            trust_remote_code=True,
+        )
+        
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Load model
+        model_kwargs = {
+            'torch_dtype': torch_dtype,
+            'device_map': self.config.device_map,
+            'trust_remote_code': True,
+        }
+        
+        # Try to use optimized attention implementations
+        if self.config.use_flash_attention:
+            try:
+                import flash_attn
+                model_kwargs['attn_implementation'] = 'flash_attention_2'
+                logger.info("Using Flash Attention 2")
+            except ImportError:
+                # Fall back to SDPA (Scaled Dot Product Attention) - built into PyTorch 2.0+
+                if TORCH_AVAILABLE and hasattr(F, 'scaled_dot_product_attention'):
+                    model_kwargs['attn_implementation'] = 'sdpa'
+                    logger.info("Using SDPA (PyTorch native, nearly as fast as Flash Attention)")
+                else:
+                    logger.warning("Flash Attention 2 not available, using default attention")
+        
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.name,
+                **model_kwargs
+            )
+        except Exception as e:
+            # Fallback: try without flash attention
+            if 'flash' in str(e).lower():
+                logger.warning(f"Flash Attention error, falling back to default: {e}")
+                model_kwargs.pop('attn_implementation', None)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.config.name,
+                    **model_kwargs
+                )
+            else:
+                raise
+        
+        if self.config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+        
+        self.model.eval()
+        self._loaded = True
+        
+        logger.info(f"Model loaded successfully on {self.device}")
+    
+    def generate(
+        self,
+        context: str,
+        question: str,
+        max_new_tokens: int = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Generate response for a question given context.
+        
+        Args:
+            context: Long context
+            question: Question to answer
+            max_new_tokens: Max tokens to generate
+        
+        Returns:
+            prediction: Generated text
+            diagnostics: Generation diagnostics
+        """
+        if not self._loaded:
+            self.load()
+        
+        max_new_tokens = max_new_tokens or self.config.max_new_tokens
+        
+        # Format prompt
+        prompt = self._format_prompt(context, question)
+        
+        # Tokenize
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors='pt',
+            truncation=True,
+            max_length=self.config.max_length - max_new_tokens,
+        )
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        # Generate
+        start_time = time.time()
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=self.config.temperature if self.config.do_sample else None,
+                do_sample=self.config.do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        
+        generation_time = (time.time() - start_time) * 1000  # ms
+        
+        # Decode
+        generated_ids = outputs[0, inputs['input_ids'].shape[1]:]
+        prediction = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        
+        # Clean prediction: take only first line/sentence (stop at newline or "Question:")
+        prediction = prediction.strip()
+        # Stop at newline
+        if '\n' in prediction:
+            prediction = prediction.split('\n')[0].strip()
+        # Stop at next question marker
+        if 'Question:' in prediction:
+            prediction = prediction.split('Question:')[0].strip()
+        # Stop at common continuation markers
+        for marker in ['Question:', 'Context:', 'Q:', 'A:', '\n\n']:
+            if marker in prediction:
+                prediction = prediction.split(marker)[0].strip()
+        
+        diagnostics = {
+            'generation_time_ms': generation_time,
+            'input_length': inputs['input_ids'].shape[1],
+            'output_length': len(generated_ids),
+            'prompt_length': len(prompt),
+        }
+        
+        return prediction.strip(), diagnostics
+    
+    def _format_prompt(self, context: str, question: str) -> str:
+        """Format context and question into prompt."""
+        model_name = self.config.name.lower()
+        
+        # Use instruction format for instruct-tuned models
+        if 'instruct' in model_name or 'chat' in model_name:
+            if 'mistral' in model_name:
+                # Mistral-Instruct format - question at END to avoid forgetting
+                prompt = f"""[INST] Read the context below and answer the question at the end.
+
+Context:
+{context}
+
+Based on the context above, answer this question: {question}
+
+Give only the answer, nothing else. [/INST]"""
+            elif 'llama' in model_name:
+                # Llama-2/3 Chat format
+                prompt = f"""[INST] <<SYS>>
+You are a helpful assistant. Answer questions based on the given context. Be concise.
+<</SYS>>
+
+Context: {context}
+
+Question: {question} [/INST]"""
+            elif 'qwen' in model_name:
+                # Qwen format - use simple instruction
+                prompt = f"""<|im_start|>system
+You are a helpful assistant. Answer questions concisely based on the given context.<|im_end|>
+<|im_start|>user
+Context: {context}
+
+Question: {question}
+
+Answer with only the answer, nothing else.<|im_end|>
+<|im_start|>assistant
+"""
+            else:
+                # Generic instruct format
+                prompt = f"""### Instruction:
+Answer the question based on the context. Output ONLY the answer.
+
+### Context:
+{context}
+
+### Question:
+{question}
+
+### Answer:"""
+        else:
+            # Base model format (completion style)
+            prompt = f"""Context: {context}
+
+Question: {question}
+
+Answer:"""
+        
+        return prompt
+    
+    def get_attention_weights(
+        self,
+        context: str,
+        question: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get attention weights for analysis.
+        
+        Returns:
+            attention_weights: [num_layers, num_heads, seq_len, seq_len]
+            query: [num_layers, num_heads, seq_len, head_dim]
+            key: [num_layers, num_heads, seq_len, head_dim]
+        """
+        if not self._loaded:
+            self.load()
+        
+        prompt = self._format_prompt(context, question)
+        
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors='pt',
+            truncation=True,
+            max_length=self.config.max_length,
+        )
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        # Forward pass with output_attentions=True
+        with torch.no_grad():
+            outputs = self.model(
+                **inputs,
+                output_attentions=True,
+                output_hidden_states=True,
+            )
+        
+        # Stack attention weights from all layers
+        # Each attention is [batch, num_heads, seq_len, seq_len]
+        attentions = torch.stack(outputs.attentions, dim=0)  # [num_layers, batch, ...]
+        attentions = attentions.squeeze(1)  # Remove batch dim
+        
+        return attentions, None, None  # Q, K extraction depends on model architecture
+
+
+# =============================================================================
+# Benchmark Runner
+# =============================================================================
+
+class BenchmarkRunner:
+    """
+    Main benchmark runner class.
+    
+    Coordinates evaluation across datasets, methods, and sparsity levels.
+    """
+    
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        output_dir: str = None,
+    ):
+        self.config = config
+        self.output_dir = Path(output_dir or config.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize model wrapper
+        self.model_wrapper = ModelWrapper(config.model)
+        
+        # Track results
+        self.results: Dict[str, MethodResult] = {}
+    
+    def run(self) -> ExperimentResult:
+        """
+        Run the complete experiment.
+        
+        Returns:
+            ExperimentResult with all results
+        """
+        start_time = datetime.now()
+        logger.info(f"Starting experiment: {self.config.name}")
+        logger.info(f"Datasets: {self.config.datasets}")
+        logger.info(f"Methods: {self.config.methods}")
+        logger.info(f"Sparsity levels: {self.config.sparsity_levels}")
+        
+        # Load model
+        self.model_wrapper.load()
+        
+        # Run for each dataset
+        all_results = {}
+        
+        for dataset_name in self.config.datasets:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Dataset: {dataset_name}")
+            logger.info(f"{'='*60}")
+            
+            # Load dataset
+            dataset = get_dataset(dataset_name)
+            dataset_config = self.config.dataset_configs.get(
+                dataset_name, ALL_DATASETS.get(dataset_name)
+            )
+            
+            logger.info(f"Loaded {len(dataset)} samples")
+            
+            # Run for each method
+            for method_name in self.config.methods:
+                # Run for each sparsity level
+                for sparsity in self.config.sparsity_levels:
+                    result_key = f"{dataset_name}_{method_name}_{sparsity}"
+                    
+                    logger.info(f"\nEvaluating: {method_name} @ {sparsity:.0%} sparsity")
+                    
+                    result = self._evaluate_method(
+                        dataset=dataset,
+                        dataset_config=dataset_config,
+                        method_name=method_name,
+                        sparsity=sparsity,
+                    )
+                    
+                    all_results[result_key] = result
+                    
+                    # Log summary
+                    self._log_result_summary(result)
+                    
+                    # Save intermediate results
+                    self._save_intermediate_result(result, result_key)
+        
+        end_time = datetime.now()
+        total_time = (end_time - start_time).total_seconds()
+        
+        # Create experiment result
+        experiment_result = ExperimentResult(
+            name=self.config.name,
+            description=self.config.description,
+            method_results=all_results,
+            config=asdict(self.config.model),
+            start_time=start_time.isoformat(),
+            end_time=end_time.isoformat(),
+            total_time_sec=total_time,
+        )
+        
+        # Save final results
+        self._save_final_results(experiment_result)
+        
+        logger.info(f"\nExperiment completed in {total_time:.1f}s")
+        logger.info(f"Results saved to: {self.output_dir}")
+        
+        return experiment_result
+    
+    def _evaluate_method(
+        self,
+        dataset: BaseBenchmarkDataset,
+        dataset_config: DatasetConfig,
+        method_name: str,
+        sparsity: float,
+    ) -> MethodResult:
+        """Evaluate a single method on a dataset."""
+        
+        # Get method with specified sparsity
+        method_config = self.config.method_configs.get(
+            method_name, METHOD_CONFIGS.get(method_name)
+        )
+        
+        # Override sparsity
+        from dataclasses import replace
+        method_config = replace(method_config, sparsity=sparsity)
+        method = get_method(method_name, config=method_config)
+        
+        # Evaluate samples
+        sample_results = []
+        start_time = time.time()
+        
+        for sample in tqdm(dataset, desc=f"Evaluating {method_name}"):
+            try:
+                result = self._evaluate_sample(sample, method, dataset_config)
+                sample_results.append(result)
+            except Exception as e:
+                logger.warning(f"Error evaluating sample {sample.sample_id}: {e}")
+                continue
+        
+        total_time = time.time() - start_time
+        
+        # Aggregate metrics
+        metrics = self._aggregate_metrics(sample_results, dataset_config.metrics)
+        
+        return MethodResult(
+            method_name=method_name,
+            dataset_name=dataset_config.name,
+            sparsity=sparsity,
+            metrics=metrics,
+            sample_results=sample_results,
+            total_time_sec=total_time,
+            samples_per_sec=len(sample_results) / total_time if total_time > 0 else 0,
+            model_name=self.config.model.name,
+        )
+    
+    def _evaluate_sample(
+        self,
+        sample: BenchmarkSample,
+        method: BaseAttentionMethod,
+        dataset_config: DatasetConfig,
+    ) -> SampleResult:
+        """Evaluate a single sample with a method."""
+        
+        # Generate prediction
+        prediction, gen_diagnostics = self.model_wrapper.generate(
+            context=sample.context,
+            question=sample.question,
+        )
+        
+        # Compute metrics
+        references = sample.answers or ([sample.answer] if sample.answer else [])
+        metrics = compute_metrics(
+            prediction=prediction,
+            references=references,
+            metrics=dataset_config.metrics,
+        )
+        
+        return SampleResult(
+            sample_id=sample.sample_id,
+            prediction=prediction,
+            references=references,
+            metrics=metrics,
+            generation_time_ms=gen_diagnostics.get('generation_time_ms', 0),
+            context_length=sample.context_length,
+        )
+    
+    def _aggregate_metrics(
+        self,
+        sample_results: List[SampleResult],
+        metric_names: List[MetricName],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Aggregate metrics across samples."""
+        metrics = {}
+        
+        for metric_name in metric_names:
+            metric_key = metric_name.value
+            scores = [r.metrics.get(metric_key, 0) for r in sample_results]
+            
+            if np is not None:
+                mean_val = float(np.mean(scores))
+                std_val = float(np.std(scores))
+                min_val = float(np.min(scores))
+                max_val = float(np.max(scores))
+            else:
+                # Fallback without numpy
+                mean_val = sum(scores) / len(scores) if scores else 0.0
+                std_val = (sum((x - mean_val) ** 2 for x in scores) / len(scores)) ** 0.5 if scores else 0.0
+                min_val = min(scores) if scores else 0.0
+                max_val = max(scores) if scores else 0.0
+            
+            metrics[metric_key] = {
+                'mean': mean_val,
+                'std': std_val,
+                'min': min_val,
+                'max': max_val,
+                'count': len(scores),
+            }
+        
+        return metrics
+    
+    def _log_result_summary(self, result: MethodResult) -> None:
+        """Log summary of result."""
+        logger.info(f"  Results for {result.method_name} @ {result.sparsity:.0%}:")
+        for metric_name, stats in result.metrics.items():
+            logger.info(f"    {metric_name}: {stats['mean']:.4f} ± {stats['std']:.4f}")
+        logger.info(f"    Throughput: {result.samples_per_sec:.2f} samples/sec")
+    
+    def _save_intermediate_result(
+        self,
+        result: MethodResult,
+        key: str,
+    ) -> None:
+        """Save intermediate result to file."""
+        result_file = self.output_dir / f"intermediate_{key}.json"
+        with open(result_file, 'w') as f:
+            json.dump(result.to_dict(), f, indent=2)
+    
+    def _save_final_results(
+        self,
+        experiment_result: ExperimentResult,
+    ) -> None:
+        """Save final experiment results."""
+        # Save full results
+        result_file = self.output_dir / f"{self.config.name}_results.json"
+        with open(result_file, 'w') as f:
+            json.dump(experiment_result.to_dict(), f, indent=2)
+        
+        # Save summary table
+        summary_file = self.output_dir / f"{self.config.name}_summary.txt"
+        with open(summary_file, 'w') as f:
+            f.write(f"Experiment: {experiment_result.name}\n")
+            f.write(f"Description: {experiment_result.description}\n")
+            f.write(f"Duration: {experiment_result.total_time_sec:.1f}s\n")
+            f.write(f"\n{'='*60}\n\n")
+            
+            # Group results by dataset
+            datasets = set()
+            for key in experiment_result.method_results.keys():
+                parts = key.split('_')
+                datasets.add(parts[0])
+            
+            for dataset in sorted(datasets):
+                f.write(f"\nDataset: {dataset}\n")
+                f.write("-" * 40 + "\n")
+                
+                for key, result in experiment_result.method_results.items():
+                    if key.startswith(dataset):
+                        f.write(f"\n{result.method_name} @ {result.sparsity:.0%}:\n")
+                        for metric, stats in result.metrics.items():
+                            f.write(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f}\n")
+        
+        logger.info(f"Results saved to {result_file}")
+        logger.info(f"Summary saved to {summary_file}")
+
+
+# =============================================================================
+# Quick Evaluation Functions
+# =============================================================================
+
+def quick_evaluate(
+    dataset_name: str,
+    method_name: str,
+    sparsity: float = 0.9,
+    max_samples: int = 10,
+    model_name: str = "meta-llama/Llama-2-7b-hf",
+) -> MethodResult:
+    """
+    Quick evaluation for testing.
+    
+    Args:
+        dataset_name: Dataset to evaluate
+        method_name: Method to use
+        sparsity: Sparsity level
+        max_samples: Maximum samples to evaluate
+        model_name: Model to use
+    
+    Returns:
+        MethodResult with evaluation results
+    
+    Example:
+        >>> result = quick_evaluate("narrativeqa", "cab_v4", sparsity=0.9, max_samples=5)
+        >>> print(result.metrics)
+    """
+    config = ExperimentConfig(
+        name=f"quick_{dataset_name}_{method_name}",
+        datasets=[dataset_name],
+        methods=[method_name],
+        sparsity_levels=[sparsity],
+        model=ModelConfig(name=model_name),
+    )
+    
+    # Override max_samples in dataset config
+    if dataset_name in config.dataset_configs:
+        config.dataset_configs[dataset_name].max_samples = max_samples
+    
+    runner = BenchmarkRunner(config, output_dir="results/quick_eval")
+    result = runner.run()
+    
+    # Return first method result
+    return list(result.method_results.values())[0]
+
+
+def evaluate_sparsity_sweep(
+    dataset_name: str,
+    method_name: str,
+    sparsity_levels: List[float] = None,
+    max_samples: int = 50,
+    model_name: str = "meta-llama/Llama-2-7b-hf",
+) -> Dict[float, MethodResult]:
+    """
+    Evaluate method across multiple sparsity levels.
+    
+    Args:
+        dataset_name: Dataset to evaluate
+        method_name: Method to use
+        sparsity_levels: List of sparsity levels
+        max_samples: Maximum samples per level
+        model_name: Model to use
+    
+    Returns:
+        Dict mapping sparsity to MethodResult
+    
+    Example:
+        >>> results = evaluate_sparsity_sweep("narrativeqa", "cab_v4")
+        >>> for sparsity, result in results.items():
+        ...     print(f"{sparsity:.0%}: F1={result.metrics['f1']['mean']:.4f}")
+    """
+    if sparsity_levels is None:
+        sparsity_levels = [0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+    
+    config = ExperimentConfig(
+        name=f"sweep_{dataset_name}_{method_name}",
+        datasets=[dataset_name],
+        methods=[method_name],
+        sparsity_levels=sparsity_levels,
+        model=ModelConfig(name=model_name),
+    )
+    
+    if dataset_name in config.dataset_configs:
+        config.dataset_configs[dataset_name].max_samples = max_samples
+    
+    runner = BenchmarkRunner(config, output_dir="results/sparsity_sweep")
+    experiment_result = runner.run()
+    
+    # Organize by sparsity
+    results = {}
+    for key, result in experiment_result.method_results.items():
+        results[result.sparsity] = result
+    
+    return results
+
+
+def compare_methods_on_dataset(
+    dataset_name: str,
+    methods: List[str] = None,
+    sparsity: float = 0.9,
+    max_samples: int = 100,
+    model_name: str = "meta-llama/Llama-2-7b-hf",
+) -> Dict[str, MethodResult]:
+    """
+    Compare multiple methods on a single dataset.
+    
+    Args:
+        dataset_name: Dataset to evaluate
+        methods: Methods to compare
+        sparsity: Sparsity level
+        max_samples: Maximum samples
+        model_name: Model to use
+    
+    Returns:
+        Dict mapping method name to MethodResult
+    
+    Example:
+        >>> results = compare_methods_on_dataset("narrativeqa", ["dense", "h2o", "cab_v4"])
+        >>> for method, result in results.items():
+        ...     print(f"{method}: F1={result.metrics['f1']['mean']:.4f}")
+    """
+    if methods is None:
+        methods = ["dense", "h2o", "cab_v4", "streaming_llm", "random"]
+    
+    config = ExperimentConfig(
+        name=f"compare_{dataset_name}",
+        datasets=[dataset_name],
+        methods=methods,
+        sparsity_levels=[sparsity],
+        model=ModelConfig(name=model_name),
+    )
+    
+    if dataset_name in config.dataset_configs:
+        config.dataset_configs[dataset_name].max_samples = max_samples
+    
+    runner = BenchmarkRunner(config, output_dir="results/method_comparison")
+    experiment_result = runner.run()
+    
+    # Organize by method
+    results = {}
+    for key, result in experiment_result.method_results.items():
+        results[result.method_name] = result
+    
+    return results
+
+
+# =============================================================================
+# CLI Entry Point (for testing)
+# =============================================================================
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Run LongBench QA Benchmark")
+    parser.add_argument("--dataset", type=str, default="narrativeqa",
+                        help="Dataset to evaluate")
+    parser.add_argument("--method", type=str, default="cab_v4",
+                        help="Method to use")
+    parser.add_argument("--sparsity", type=float, default=0.9,
+                        help="Sparsity level")
+    parser.add_argument("--max-samples", type=int, default=10,
+                        help="Maximum samples")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf",
+                        help="Model to use")
+    
+    args = parser.parse_args()
+    
+    print(f"Running quick evaluation:")
+    print(f"  Dataset: {args.dataset}")
+    print(f"  Method: {args.method}")
+    print(f"  Sparsity: {args.sparsity:.0%}")
+    print(f"  Max samples: {args.max_samples}")
+    print(f"  Model: {args.model}")
+    
+    try:
+        result = quick_evaluate(
+            dataset_name=args.dataset,
+            method_name=args.method,
+            sparsity=args.sparsity,
+            max_samples=args.max_samples,
+            model_name=args.model,
+        )
+        
+        print("\nResults:")
+        for metric, stats in result.metrics.items():
+            print(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f}")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise
+

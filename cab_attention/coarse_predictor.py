@@ -10,7 +10,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 from .kernels.coarsening import coarsen_qk_max_l2_pytorch, coarsen_qk_max_l2
-from .kernels.frc_kernel import compute_block_frc, generate_block_mask_from_frc
+from .kernels.frc_kernel import compute_block_frc, generate_block_mask
 
 
 class CoarseCurvaturePredictor(nn.Module):
@@ -48,6 +48,8 @@ class CoarseCurvaturePredictor(nn.Module):
         keep_diagonal: bool = True,
         causal: bool = False,
         temperature: float = 1.0,
+        adaptive_block_size: bool = True,  # NEW: auto-adjust block_size for long sequences
+        max_blocks: int = 512,             # NEW: target maximum number of blocks
     ):
         super().__init__()
         self.block_size = block_size
@@ -57,6 +59,8 @@ class CoarseCurvaturePredictor(nn.Module):
         self.keep_diagonal = keep_diagonal
         self.causal = causal
         self.temperature = temperature
+        self.adaptive_block_size = adaptive_block_size
+        self.max_blocks = max_blocks
 
         # Check if Triton is available
         self._triton_available = False
@@ -66,6 +70,31 @@ class CoarseCurvaturePredictor(nn.Module):
         except ImportError:
             if use_triton:
                 print("Warning: Triton not available, falling back to PyTorch implementation")
+    
+    def _get_adaptive_block_size(self, N: int) -> int:
+        """
+        Compute adaptive block size to keep number of blocks manageable.
+        
+        The redundancy computation is O(M³) where M = N / block_size.
+        To keep M <= max_blocks, we need block_size >= N / max_blocks.
+        
+        Returns power-of-2 block size for optimal kernel performance.
+        """
+        if not self.adaptive_block_size:
+            return self.block_size
+        
+        # Calculate minimum block_size to keep M <= max_blocks
+        min_block_size = (N + self.max_blocks - 1) // self.max_blocks
+        
+        # Round up to next power of 2 (required by Triton kernel)
+        block_size = self.block_size
+        while block_size < min_block_size:
+            block_size *= 2
+        
+        # Cap at reasonable maximum
+        block_size = min(block_size, 512)
+        
+        return block_size
 
     def forward(
         self,
@@ -86,24 +115,26 @@ class CoarseCurvaturePredictor(nn.Module):
             diagnostics: (optional) Dict with FRC scores, affinity, etc.
         """
         B, H, N, D = q.shape
+        
+        # Get block size (may be adapted for long sequences)
+        block_size = self._get_adaptive_block_size(N)
 
         # Stage 1: Coarsening (Task 1.1)
         if self._triton_available and self.use_triton:
-            q_coarse, k_coarse = coarsen_qk_max_l2(q, k, self.block_size)
+            q_coarse, k_coarse = coarsen_qk_max_l2(q, k, block_size)
         else:
-            q_coarse, k_coarse = coarsen_qk_max_l2_pytorch(q, k, self.block_size)
+            q_coarse, k_coarse = coarsen_qk_max_l2_pytorch(q, k, block_size)
 
         # Stage 2: FRC Computation (Task 1.2)
-        frc_scores, affinity, triangles = compute_block_frc(
+        frc_scores, affinity, redundancy = compute_block_frc(
             q_coarse,
             k_coarse,
             temperature=self.temperature,
-            use_relu=True,
             lambda_redundancy=self.lambda_redundancy,
         )
 
         # Stage 3: Mask Generation
-        block_mask = generate_block_mask_from_frc(
+        block_mask = generate_block_mask(
             frc_scores,
             sparsity=self.sparsity,
             keep_diagonal=self.keep_diagonal,
@@ -114,7 +145,7 @@ class CoarseCurvaturePredictor(nn.Module):
             diagnostics = {
                 'frc_scores': frc_scores,
                 'affinity': affinity,
-                'triangles': triangles,
+                'redundancy': redundancy,
                 'q_coarse': q_coarse,
                 'k_coarse': k_coarse,
                 'block_mask': block_mask,
@@ -131,7 +162,8 @@ class CoarseCurvaturePredictor(nn.Module):
 
         This is useful for profiling and understanding overhead.
         """
-        M = (N + self.block_size - 1) // self.block_size
+        block_size = self._get_adaptive_block_size(N)
+        M = (N + block_size - 1) // block_size
 
         # Coarsening: O(N * D) for L2 norms
         coarsening_flops = N * D
@@ -170,7 +202,7 @@ class AdaptiveCurvaturePredictor(CoarseCurvaturePredictor):
         percentile_threshold: float = 5.0,  # Keep bottom 5% of FRC scores
         **kwargs
     ):
-        super().__init__(block_size=target_sparsity, sparsity=target_sparsity, **kwargs)
+        super().__init__(block_size=block_size, sparsity=target_sparsity, **kwargs)
         self.percentile_threshold = percentile_threshold
 
     def forward(
@@ -183,19 +215,21 @@ class AdaptiveCurvaturePredictor(CoarseCurvaturePredictor):
         Generate block mask with adaptive threshold.
         """
         B, H, N, D = q.shape
+        
+        # Get adaptive block size for long sequences
+        block_size = self._get_adaptive_block_size(N)
 
         # Coarsening
         if self._triton_available and self.use_triton:
-            q_coarse, k_coarse = coarsen_qk_max_l2(q, k, self.block_size)
+            q_coarse, k_coarse = coarsen_qk_max_l2(q, k, block_size)
         else:
-            q_coarse, k_coarse = coarsen_qk_max_l2_pytorch(q, k, self.block_size)
+            q_coarse, k_coarse = coarsen_qk_max_l2_pytorch(q, k, block_size)
 
         # FRC Computation
-        frc_scores, affinity, triangles = compute_block_frc(
+        frc_scores, affinity, redundancy = compute_block_frc(
             q_coarse,
             k_coarse,
             temperature=self.temperature,
-            use_relu=True,
             lambda_redundancy=self.lambda_redundancy,
         )
 
@@ -220,7 +254,7 @@ class AdaptiveCurvaturePredictor(CoarseCurvaturePredictor):
             diagnostics = {
                 'frc_scores': frc_scores,
                 'affinity': affinity,
-                'triangles': triangles,
+                'redundancy': redundancy,
                 'threshold': threshold.item(),
                 'effective_sparsity': 1.0 - block_mask.float().mean().item(),
             }

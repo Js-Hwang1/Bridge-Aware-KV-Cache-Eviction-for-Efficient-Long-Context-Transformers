@@ -1,0 +1,31 @@
+# Quick Test Configuration
+# ========================
+# For rapid testing and debugging. ~5 minutes on single GPU.
+
+name: quick_test
+description: Quick test with minimal samples for debugging
+
+datasets:
+  - narrativeqa
+
+methods:
+  - dense
+  - h2o
+  - cab_v4
+
+sparsity_levels:
+  - 0.9
+
+model:
+  name: meta-llama/Llama-2-7b-hf
+  torch_dtype: float16
+  max_length: 4096
+  max_new_tokens: 128
+
+max_samples: 10
+batch_size: 1
+seed: 42
+
+output_dir: results/quick_test
+save_predictions: true
+
