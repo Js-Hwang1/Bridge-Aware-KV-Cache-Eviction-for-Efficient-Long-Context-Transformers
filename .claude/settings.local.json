@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no simple-survey-ser-ordered.trycloudflare.com \"pwd\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

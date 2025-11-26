@@ -1,0 +1,32 @@
+# CAB-Attention Requirements
+# Core dependencies for Curvature-Aware Block-Sparse Attention
+
+# PyTorch (2.5+ recommended for FlexAttention support)
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Triton for custom CUDA kernels (optional but recommended)
+triton>=2.1.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+pandas>=2.0.0
+
+# Graph processing (for validation experiments)
+networkx>=3.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Jupyter for interactive development
+jupyter>=1.0.0
+ipykernel>=6.25.0
+
+# Optional: Profiling and optimization
+# nvidia-ml-py3>=7.352.0  # For GPU monitoring
+# py-spy>=0.3.14  # For profiling
