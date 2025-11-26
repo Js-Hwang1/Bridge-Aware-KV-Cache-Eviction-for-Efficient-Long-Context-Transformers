@@ -11,18 +11,25 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 32}),
+        triton.Config({'BLOCK_D': 64}),
+        triton.Config({'BLOCK_D': 128}),
+        triton.Config({'BLOCK_D': 256}),
+    ],
+    key=['N', 'D', 'BLOCK_SIZE'],
+)
 @triton.jit
 def _coarsen_max_l2_kernel(
     # Input tensors
     input_ptr,  # [B, H, N, D]
     output_ptr,  # [B, H, M, D]
     # Dimensions
-    B: tl.constexpr,
-    H: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
-    M: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     # Strides
     stride_b,
     stride_h,
@@ -34,8 +41,19 @@ def _coarsen_max_l2_kernel(
     stride_out_d,
 ):
     """
-    For each block of BLOCK_SIZE tokens, find the token with max L2 norm
-    and use it as the representative.
+    Production-quality Max-L2 coarsening kernel with full vectorization.
+
+    Each program handles one (B, H, M) block:
+    1. Loads BLOCK_SIZE tokens' embeddings in parallel (BLOCK_SIZE × D matrix)
+    2. Computes L2 norms for all tokens in parallel
+    3. Uses argmax to select token with max norm
+    4. Writes selected token to output
+
+    Key optimizations:
+    - Vectorized loads for D dimension (memory coalescing)
+    - Parallel norm computation across tokens
+    - Single-pass algorithm (no redundant loads)
+    - Autotuning to find optimal BLOCK_D for hardware
     """
     # Program IDs
     pid_b = tl.program_id(0)  # Batch dimension
@@ -45,53 +63,100 @@ def _coarsen_max_l2_kernel(
     # Calculate the starting token index for this block
     token_start = pid_m * BLOCK_SIZE
 
-    # Load all tokens in this block and compute their L2 norms
-    max_norm = -1.0
-    max_idx = 0
+    # Create token offset range [0, 1, 2, ..., BLOCK_SIZE-1]
+    # This allows us to process BLOCK_SIZE tokens in parallel
+    token_offsets = tl.arange(0, BLOCK_SIZE)
+    token_indices = token_start + token_offsets
+    token_mask = token_indices < N  # Handle boundary case (last block may be partial)
 
-    # Loop through tokens in this block
-    for local_idx in range(BLOCK_SIZE):
-        token_idx = token_start + local_idx
-        if token_idx < N:
-            # Compute L2 norm for this token
-            norm_sq = 0.0
-            for d in range(D):
-                ptr_offset = (pid_b * stride_b + pid_h * stride_h +
-                             token_idx * stride_n + d * stride_d)
-                val = tl.load(input_ptr + ptr_offset)
-                norm_sq += val * val
+    # Base pointer for this (batch, head) position
+    # All subsequent loads are relative to this base
+    base_ptr = input_ptr + pid_b * stride_b + pid_h * stride_h
 
-            norm = tl.sqrt(norm_sq)
-            if norm > max_norm:
-                max_norm = norm
-                max_idx = local_idx
+    # Initialize accumulator for squared L2 norms [BLOCK_SIZE]
+    # Each element will hold ||token_i||^2
+    norms_sq = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
 
-    # Now load the selected token (the one with max L2 norm)
+    # Process D dimension in chunks of BLOCK_D
+    # This loop is sequential but each iteration loads BLOCK_SIZE × BLOCK_D values in parallel
+    for d_start in range(0, D, BLOCK_D):
+        # D-dimension offsets for this chunk
+        d_offsets = tl.arange(0, BLOCK_D)
+        d_indices = d_start + d_offsets
+        d_mask = d_indices < D  # Handle case where D is not multiple of BLOCK_D
+
+        # Create 2D mask: [BLOCK_SIZE, BLOCK_D]
+        # This broadcasts token_mask and d_mask to create a 2D mask
+        # True only where both token is valid AND dimension is valid
+        mask_2d = token_mask[:, None] & d_mask[None, :]
+
+        # Compute offsets for 2D load: [BLOCK_SIZE, BLOCK_D]
+        # This creates a matrix of memory offsets for the entire (BLOCK_SIZE × BLOCK_D) tile
+        # Broadcasting rules:
+        #   token_indices[:, None] has shape [BLOCK_SIZE, 1]
+        #   d_indices[None, :] has shape [1, BLOCK_D]
+        #   Result has shape [BLOCK_SIZE, BLOCK_D]
+        offsets_2d = (token_indices[:, None] * stride_n +
+                      d_indices[None, :] * stride_d)
+
+        # 🚀 KEY OPTIMIZATION: Vectorized 2D load
+        # This single tl.load fetches an entire (BLOCK_SIZE × BLOCK_D) tile from memory
+        # GPU hardware coalesces these accesses for maximum memory bandwidth
+        # Old (slow): for-loop loading D scalars sequentially
+        # New (fast): single load of BLOCK_SIZE × BLOCK_D matrix
+        vals = tl.load(base_ptr + offsets_2d, mask=mask_2d, other=0.0)
+
+        # Accumulate squared norms: sum over D dimension (axis=1)
+        # vals has shape [BLOCK_SIZE, BLOCK_D]
+        # vals * vals computes element-wise squares
+        # tl.sum(..., axis=1) reduces to [BLOCK_SIZE]
+        norms_sq += tl.sum(vals * vals, axis=1)
+
+    # Find token with maximum L2 norm
+    norms = tl.sqrt(norms_sq)
+
+    # Mask out invalid tokens (set their norms to -inf)
+    norms = tl.where(token_mask, norms, float('-inf'))
+
+    # Get index of max norm token (scalar within this block)
+    max_idx = tl.argmax(norms, axis=0)
     selected_token_idx = token_start + max_idx
 
-    # Copy the selected token to output
-    for d in range(D):
-        in_offset = (pid_b * stride_b + pid_h * stride_h +
-                    selected_token_idx * stride_n + d * stride_d)
-        out_offset = (pid_b * stride_out_b + pid_h * stride_out_h +
-                     pid_m * stride_out_m + d * stride_out_d)
+    # Write selected token to output (vectorized write)
+    output_base = (output_ptr + pid_b * stride_out_b +
+                   pid_h * stride_out_h + pid_m * stride_out_m)
+    input_base = base_ptr + selected_token_idx * stride_n
 
-        val = tl.load(input_ptr + in_offset)
-        tl.store(output_ptr + out_offset, val)
+    # Write D dimension in chunks of BLOCK_D
+    for d_start in range(0, D, BLOCK_D):
+        d_offsets = tl.arange(0, BLOCK_D)
+        d_indices = d_start + d_offsets
+        d_mask = d_indices < D
+
+        # Vectorized load from selected token
+        vals = tl.load(input_base + d_indices * stride_d, mask=d_mask, other=0.0)
+
+        # Vectorized store to output
+        tl.store(output_base + d_indices * stride_out_d, vals, mask=d_mask)
 
 
 def coarsen_qk_max_l2(q: torch.Tensor, k: torch.Tensor, block_size: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Coarsens Q and K tensors using Max-L2 pooling.
+    Coarsens Q and K tensors using Max-L2 pooling with optimized Triton kernel.
 
     Args:
         q: Query tensor [B, H, N, D]
         k: Key tensor [B, H, N, D]
-        block_size: Number of tokens per block (default: 64)
+        block_size: Number of tokens per block (default: 64, must be power of 2)
 
     Returns:
         q_coarse: [B, H, M, D] where M = ceil(N / block_size)
         k_coarse: [B, H, M, D]
+
+    Performance notes:
+        - Fully vectorized kernel with memory coalescing
+        - block_size should be power of 2 for optimal performance (32, 64, 128)
+        - D dimension is processed in chunks for efficiency
 
     Example:
         >>> q = torch.randn(2, 8, 128000, 128, device='cuda')
@@ -101,6 +166,7 @@ def coarsen_qk_max_l2(q: torch.Tensor, k: torch.Tensor, block_size: int = 64) ->
     """
     B, H, N, D = q.shape
     assert k.shape == (B, H, N, D), "Q and K must have same shape"
+    assert q.is_cuda and k.is_cuda, "Tensors must be on CUDA device"
 
     # Calculate number of blocks
     M = (N + block_size - 1) // block_size  # Ceiling division
@@ -108,6 +174,9 @@ def coarsen_qk_max_l2(q: torch.Tensor, k: torch.Tensor, block_size: int = 64) ->
     # Allocate output tensors
     q_coarse = torch.empty(B, H, M, D, dtype=q.dtype, device=q.device)
     k_coarse = torch.empty(B, H, M, D, dtype=k.dtype, device=k.device)
+
+    # Ensure block_size is power of 2 for optimal performance
+    assert block_size & (block_size - 1) == 0, "block_size must be power of 2"
 
     # Define grid (parallelize over batch, heads, and blocks)
     grid = (B, H, M)
@@ -118,20 +187,22 @@ def coarsen_qk_max_l2(q: torch.Tensor, k: torch.Tensor, block_size: int = 64) ->
     strides_q_out = q_coarse.stride()
     strides_k_out = k_coarse.stride()
 
-    # Launch kernel for Q
+    # Launch kernel for Q (BLOCK_D is autotuned, don't pass it)
     _coarsen_max_l2_kernel[grid](
         q, q_coarse,
-        B, H, N, D, M, block_size,
-        strides_q[0], strides_q[1], strides_q[2], strides_q[3],
-        strides_q_out[0], strides_q_out[1], strides_q_out[2], strides_q_out[3]
+        N=N, D=D, BLOCK_SIZE=block_size,
+        stride_b=strides_q[0], stride_h=strides_q[1], stride_n=strides_q[2], stride_d=strides_q[3],
+        stride_out_b=strides_q_out[0], stride_out_h=strides_q_out[1],
+        stride_out_m=strides_q_out[2], stride_out_d=strides_q_out[3]
     )
 
-    # Launch kernel for K
+    # Launch kernel for K (BLOCK_D is autotuned, don't pass it)
     _coarsen_max_l2_kernel[grid](
         k, k_coarse,
-        B, H, N, D, M, block_size,
-        strides_k[0], strides_k[1], strides_k[2], strides_k[3],
-        strides_k_out[0], strides_k_out[1], strides_k_out[2], strides_k_out[3]
+        N=N, D=D, BLOCK_SIZE=block_size,
+        stride_b=strides_k[0], stride_h=strides_k[1], stride_n=strides_k[2], stride_d=strides_k[3],
+        stride_out_b=strides_k_out[0], stride_out_h=strides_k_out[1],
+        stride_out_m=strides_k_out[2], stride_out_d=strides_k_out[3]
     )
 
     return q_coarse, k_coarse
