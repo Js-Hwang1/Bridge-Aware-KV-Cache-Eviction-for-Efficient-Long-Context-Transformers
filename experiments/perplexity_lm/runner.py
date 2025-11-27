@@ -55,17 +55,21 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 
 
 # =============================================================================
-# Sparse Perplexity Evaluator
+# Sparse Perplexity Evaluator with Attention Replacement
 # =============================================================================
 
 class SparsePerplexityEvaluator:
     """
-    Perplexity evaluator with proper sparse attention via sliding window.
+    Perplexity evaluator with ACTUAL sparse attention layer replacement.
     
-    For fair apple-to-apple comparison, all sparse methods use the same
-    mechanism: sliding window evaluation with KV cache pruning.
+    This replaces the model's attention layers with sparse implementations:
+    - Dense: Standard attention (baseline)
+    - H2O: Heavy Hitter Oracle (Zhang et al., 2023)
+    - CAB V4: Curvature-Aware Block-Sparse (Ours)
+    - StreamingLLM: Attention Sinks (Xiao et al., 2023)
+    - Local+Strided: Sparse Transformer (Child et al., 2019)
     
-    This matches how sparse attention works in practice (generation).
+    ICML Submission Grade: Each method implements the EXACT published algorithm.
     """
     
     def __init__(
@@ -77,7 +81,6 @@ class SparsePerplexityEvaluator:
         method: str = "dense",
         sparsity: float = 0.0,
         magnitude_ratio: float = 0.5,
-        stride: int = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -86,9 +89,51 @@ class SparsePerplexityEvaluator:
         self.method = method
         self.sparsity = sparsity
         self.magnitude_ratio = magnitude_ratio
-        self.stride = stride or max(max_length // 4, 256)
+        
+        # Store original attention layers
+        self.original_attentions = None
+        self.attention_replaced = False
         
         self.model.eval()
+    
+    def _replace_attention(self):
+        """Replace attention layers with sparse implementation."""
+        if self.attention_replaced:
+            return
+        
+        from .attention_replacement import (
+            replace_attention_layers,
+            get_original_attention_layers,
+        )
+        
+        # Store originals for restoration
+        self.original_attentions = get_original_attention_layers(self.model)
+        
+        # Replace with sparse attention
+        method_kwargs = {}
+        if self.method in ['cab_v4', 'cab_v3']:
+            method_kwargs['magnitude_ratio'] = self.magnitude_ratio if self.method == 'cab_v4' else 0.0
+        
+        replace_attention_layers(
+            self.model,
+            method=self.method,
+            sparsity=self.sparsity,
+            **method_kwargs,
+        )
+        
+        self.attention_replaced = True
+        logger.info(f"Attention layers replaced with {self.method} (sparsity={self.sparsity})")
+    
+    def _restore_attention(self):
+        """Restore original attention layers."""
+        if not self.attention_replaced or self.original_attentions is None:
+            return
+        
+        from .attention_replacement import restore_attention_layers
+        
+        restore_attention_layers(self.model, self.original_attentions)
+        self.attention_replaced = False
+        logger.info("Original attention layers restored")
     
     @torch.no_grad()
     def evaluate_batch(
@@ -96,132 +141,27 @@ class SparsePerplexityEvaluator:
         input_ids: torch.Tensor,
     ) -> Tuple[float, float, int]:
         """
-        Evaluate perplexity on a batch.
-        
-        For sparse methods: Use importance-weighted context window.
-        This is efficient and provides fair comparison.
+        Evaluate perplexity with sparse attention.
         """
         B, N = input_ids.shape
         input_ids = input_ids.to(self.device)
         
-        # For dense or no sparsity, use standard evaluation
+        # For dense or zero sparsity, use standard evaluation
         if self.method == "dense" or self.sparsity == 0:
             outputs = self.model(input_ids=input_ids, labels=input_ids)
             loss = outputs.loss.item()
             num_tokens = N - 1
             return math.exp(loss), loss, num_tokens
         
-        # For sparse methods, select important tokens and evaluate
-        keep_ratio = 1.0 - self.sparsity
-        num_keep = max(8, int(N * keep_ratio))
+        # Replace attention layers with sparse implementation
+        self._replace_attention()
         
-        # Get hidden states to compute importance
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-        
-        # Use embedding layer output for importance (fast)
-        hidden = outputs.hidden_states[0]  # [B, N, D]
-        
-        # Compute importance for each position
-        importance = self._compute_hidden_importance(hidden, self.method, self.magnitude_ratio)
-        
-        # For perplexity: keep important positions + always keep recent context
-        # This simulates sparse attention fairly
-        recent_window = max(num_keep // 4, 16)
-        
-        # Always keep last 'recent_window' tokens
-        importance[:, -recent_window:] = float('inf')
-        
-        # Select top-k positions
-        _, keep_idx = torch.topk(importance, k=num_keep, dim=-1)
-        keep_idx, _ = torch.sort(keep_idx, dim=-1)
-        
-        # Gather selected tokens
-        selected_ids = torch.gather(input_ids, 1, keep_idx)
-        
-        # Evaluate on selected tokens
-        outputs = self.model(input_ids=selected_ids, labels=selected_ids)
+        # Standard forward pass with replaced attention
+        outputs = self.model(input_ids=input_ids, labels=input_ids)
         loss = outputs.loss.item()
+        num_tokens = N - 1
         
-        # Scale loss to account for context reduction
-        # This makes comparison fairer
-        scale_factor = 1.0 + (1.0 - keep_ratio) * 0.5  # Penalty for less context
-        adjusted_loss = loss * scale_factor
-        
-        num_tokens = num_keep - 1
-        perplexity = math.exp(adjusted_loss)
-        
-        return perplexity, adjusted_loss, num_tokens
-    
-    def _compute_hidden_importance(
-        self,
-        hidden: torch.Tensor,
-        method: str,
-        magnitude_ratio: float,
-    ) -> torch.Tensor:
-        """
-        Compute importance from hidden states.
-        
-        Args:
-            hidden: [B, N, D] hidden states
-            method: Selection method
-            magnitude_ratio: For CAB V4
-        
-        Returns:
-            importance: [B, N] importance scores
-        """
-        B, N, D = hidden.shape
-        device = hidden.device
-        
-        if method == "h2o":
-            # H2O: L2 norm (magnitude)
-            return hidden.norm(dim=-1)
-        
-        elif method == "cab_v3":
-            # CAB V3: Uniqueness only
-            h_norm = F.normalize(hidden, dim=-1)
-            sim = torch.matmul(h_norm, h_norm.transpose(-2, -1))
-            redundancy = sim.mean(dim=-1)
-            return 1.0 - redundancy
-        
-        elif method == "cab_v4":
-            # CAB V4: Hybrid magnitude + uniqueness
-            magnitude = hidden.norm(dim=-1)
-            
-            h_norm = F.normalize(hidden, dim=-1)
-            sim = torch.matmul(h_norm, h_norm.transpose(-2, -1))
-            redundancy = sim.mean(dim=-1)
-            uniqueness = 1.0 - redundancy
-            
-            # Normalize
-            mag_norm = (magnitude - magnitude.min(-1, keepdim=True)[0]) / \
-                       (magnitude.max(-1, keepdim=True)[0] - magnitude.min(-1, keepdim=True)[0] + 1e-8)
-            uniq_norm = (uniqueness - uniqueness.min(-1, keepdim=True)[0]) / \
-                        (uniqueness.max(-1, keepdim=True)[0] - uniqueness.min(-1, keepdim=True)[0] + 1e-8)
-            
-            return magnitude_ratio * mag_norm + (1 - magnitude_ratio) * uniq_norm
-        
-        elif method == "streaming_llm":
-            # StreamingLLM: sinks + recency
-            importance = torch.arange(N, device=device).float().unsqueeze(0).expand(B, -1)
-            importance[:, :4] = N + 1000  # Always keep sinks
-            return importance
-        
-        elif method == "local_strided":
-            # Local + strided
-            importance = torch.zeros(B, N, device=device)
-            local_start = int(N * 0.75)
-            importance[:, local_start:] = 1e6
-            strided = torch.arange(0, local_start, 4, device=device)
-            importance[:, strided] = 1e3
-            return importance
-        
-        else:  # random
-            return torch.rand(B, N, device=device)
+        return math.exp(loss), loss, num_tokens
     
     @torch.no_grad()
     def evaluate_dataset(
@@ -233,6 +173,10 @@ class SparsePerplexityEvaluator:
         """
         Evaluate perplexity on entire dataset.
         """
+        # Replace attention once at the start
+        if self.method != "dense" and self.sparsity > 0:
+            self._replace_attention()
+        
         total_nll = 0.0
         total_tokens = 0
         num_samples = 0
@@ -269,6 +213,9 @@ class SparsePerplexityEvaluator:
             if verbose and (batch_idx + 1) % 10 == 0:
                 current_ppl = math.exp(total_nll / total_tokens) if total_tokens > 0 else float('nan')
                 logger.info(f"Processed {num_samples} samples, current PPL: {current_ppl:.2f}")
+        
+        # Restore original attention
+        self._restore_attention()
         
         if total_tokens == 0:
             return PerplexityResult(
