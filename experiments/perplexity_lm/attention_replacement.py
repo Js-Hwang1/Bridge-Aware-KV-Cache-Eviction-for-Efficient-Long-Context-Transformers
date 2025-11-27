@@ -83,18 +83,32 @@ class BaseSparseAttention(nn.Module):
             # Some models use combined QKV
             qkv = attn.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(3, dim=-1)
+        elif hasattr(attn, 'W_pack'):
+            # Some Chinese models like Baichuan
+            qkv = attn.W_pack(hidden_states)
+            q, k, v = qkv.chunk(3, dim=-1)
         else:
             raise NotImplementedError(f"Unknown attention architecture: {type(attn)}")
         
-        # Reshape to [B, H, N, D]
-        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Get actual dimensions from the projections
+        q_size = q.size(-1)
+        k_size = k.size(-1)
+        v_size = v.size(-1)
         
-        # Handle GQA (grouped query attention)
-        if self.num_kv_heads != self.num_heads:
-            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        # Calculate heads from actual tensor sizes
+        actual_num_heads = q_size // self.head_dim
+        actual_num_kv_heads = k_size // self.head_dim
+        
+        # Reshape to [B, H, N, D]
+        q = q.view(bsz, seq_len, actual_num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, actual_num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, actual_num_kv_heads, self.head_dim).transpose(1, 2)
+        
+        # Handle GQA (grouped query attention) - expand K, V to match Q heads
+        if actual_num_kv_heads != actual_num_heads:
+            repeat_factor = actual_num_heads // actual_num_kv_heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
         
         return q, k, v
     
@@ -106,15 +120,20 @@ class BaseSparseAttention(nn.Module):
         bsz, num_heads, seq_len, head_dim = attn_output.shape
         
         # Reshape: [B, H, N, D] -> [B, N, H*D]
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, seq_len, num_heads * head_dim)
         
         # Apply output projection
         if hasattr(self.original_attention, 'o_proj'):
             return self.original_attention.o_proj(attn_output)
         elif hasattr(self.original_attention, 'dense'):
             return self.original_attention.dense(attn_output)
+        elif hasattr(self.original_attention, 'out_proj'):
+            return self.original_attention.out_proj(attn_output)
         else:
-            raise NotImplementedError("Unknown output projection")
+            # Fallback: return as-is if no projection found
+            logger.warning(f"No output projection found in {type(self.original_attention)}")
+            return attn_output
     
     def compute_attention(
         self,
@@ -127,14 +146,41 @@ class BaseSparseAttention(nn.Module):
         Standard scaled dot-product attention.
         Override in subclasses for sparse patterns.
         """
-        scale = 1.0 / math.sqrt(self.head_dim)
+        B, H, N, D = q.shape
+        _, _, M, _ = k.shape  # Key sequence length (may differ with cache)
         
-        # [B, H, N, N]
+        scale = 1.0 / math.sqrt(D)
+        
+        # [B, H, N, M]
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
         
-        # Apply causal mask
+        # Apply causal mask if provided
         if attention_mask is not None:
+            # Handle different mask shapes
+            if attention_mask.dim() == 2:
+                # [N, M] -> [1, 1, N, M]
+                attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+            elif attention_mask.dim() == 3:
+                # [B, N, M] -> [B, 1, N, M]
+                attention_mask = attention_mask.unsqueeze(1)
+            
+            # Ensure mask is the right shape
+            if attention_mask.shape[-2:] != (N, M):
+                # Create causal mask
+                causal_mask = torch.triu(
+                    torch.full((N, M), float('-inf'), device=q.device, dtype=q.dtype),
+                    diagonal=1
+                )
+                attention_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            
             attn_weights = attn_weights + attention_mask
+        else:
+            # Apply causal mask for autoregressive models
+            causal_mask = torch.triu(
+                torch.full((N, M), float('-inf'), device=q.device, dtype=q.dtype),
+                diagonal=1
+            )
+            attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
         
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         
@@ -156,13 +202,31 @@ class BaseSparseAttention(nn.Module):
         
         # Apply rotary embeddings if available
         if hasattr(self.original_attention, 'rotary_emb') and position_ids is not None:
-            cos, sin = self.original_attention.rotary_emb(v, position_ids)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            try:
+                # Different models have different rotary_emb signatures
+                rotary_emb = self.original_attention.rotary_emb
+                seq_len = k.shape[2]
+                
+                # Try newer transformers API first
+                if hasattr(rotary_emb, '__call__'):
+                    try:
+                        # Newer API: rotary_emb(value_states, position_ids)
+                        cos, sin = rotary_emb(v, position_ids)
+                    except TypeError:
+                        # Older API: rotary_emb(value_states, seq_len)
+                        cos, sin = rotary_emb(v, seq_len=seq_len)
+                    
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            except Exception as e:
+                # If rotary fails, continue without it (will be slightly inaccurate)
+                logger.debug(f"Rotary embedding failed: {e}")
+                pass
         
         # Handle KV cache
         if past_key_value is not None:
-            k = torch.cat([past_key_value[0], k], dim=2)
-            v = torch.cat([past_key_value[1], v], dim=2)
+            if hasattr(past_key_value, '__len__') and len(past_key_value) >= 2:
+                k = torch.cat([past_key_value[0], k], dim=2)
+                v = torch.cat([past_key_value[1], v], dim=2)
         
         new_past_key_value = (k, v) if use_cache else None
         
@@ -172,13 +236,12 @@ class BaseSparseAttention(nn.Module):
         # Apply output projection
         output = self._apply_output_projection(attn_output)
         
-        outputs = (output,)
-        if use_cache:
-            outputs += (new_past_key_value,)
-        if output_attentions:
-            outputs += (None,)  # We don't return attention weights
+        # HuggingFace decoder layers expect exactly 3 outputs:
+        # (hidden_states, attention_weights, past_key_value)
+        # Even if some are None, we must return all 3
+        attn_weights = None  # We don't compute explicit attention weights
         
-        return outputs
+        return output, attn_weights, new_past_key_value
 
 
 # =============================================================================

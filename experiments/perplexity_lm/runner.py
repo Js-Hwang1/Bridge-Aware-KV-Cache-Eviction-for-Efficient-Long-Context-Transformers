@@ -199,7 +199,9 @@ class SparsePerplexityEvaluator:
                 try:
                     ppl, ce, n_tokens = self.evaluate_batch(sample_ids)
                 except Exception as e:
+                    import traceback
                     logger.warning(f"Error evaluating sample {num_samples}: {e}")
+                    logger.debug(traceback.format_exc())
                     ppl, ce, n_tokens = float('nan'), float('nan'), 0
                 
                 if not math.isnan(ce):
