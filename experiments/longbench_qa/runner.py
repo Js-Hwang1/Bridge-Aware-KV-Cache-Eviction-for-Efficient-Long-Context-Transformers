@@ -426,6 +426,14 @@ Answer:"""
         batch_size = inputs['input_ids'].shape[0]
         num_keep_ratio = 1.0 - sparsity
         
+        # Try to import DynamicCache for proper cache handling
+        try:
+            from transformers.cache_utils import DynamicCache
+            has_dynamic_cache = True
+        except ImportError:
+            has_dynamic_cache = False
+            DynamicCache = None
+        
         # Initial forward pass to get KV cache
         with torch.no_grad():
             outputs = self.model(
@@ -437,9 +445,12 @@ Answer:"""
         past_key_values = outputs.past_key_values
         next_token_logits = outputs.logits[:, -1, :]
         
+        # Check cache type and prune accordingly
+        uses_dynamic_cache = has_dynamic_cache and isinstance(past_key_values, DynamicCache)
+        
         # Prune initial KV cache
-        past_key_values = self._prune_kv_cache(
-            past_key_values, num_keep_ratio, method, magnitude_ratio
+        past_key_values, kept_indices = self._prune_kv_cache_v2(
+            past_key_values, num_keep_ratio, method, magnitude_ratio, uses_dynamic_cache, DynamicCache
         )
         
         # Generate tokens one by one
@@ -455,18 +466,6 @@ Answer:"""
                 if (next_token == self.tokenizer.eos_token_id).all():
                     break
             
-            # Forward pass with pruned cache
-            # Get cache length (handle both DynamicCache and tuple formats)
-            if past_key_values is None:
-                cache_len = 0
-            elif hasattr(past_key_values, 'get_seq_length'):
-                cache_len = past_key_values.get_seq_length()
-            elif hasattr(past_key_values, 'key_cache'):
-                cache_len = past_key_values.key_cache[0].shape[2] if past_key_values.key_cache[0] is not None else 0
-            else:
-                cache_len = past_key_values[0][0].shape[2]
-            position_ids = torch.tensor([[cache_len]], device=device)
-            
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=next_token,
@@ -480,77 +479,79 @@ Answer:"""
             
             # Prune cache periodically (every 5 tokens to balance speed/sparsity)
             if (step + 1) % 5 == 0:
-                past_key_values = self._prune_kv_cache(
-                    past_key_values, num_keep_ratio, method, magnitude_ratio
+                uses_dynamic_cache = has_dynamic_cache and isinstance(past_key_values, DynamicCache)
+                past_key_values, kept_indices = self._prune_kv_cache_v2(
+                    past_key_values, num_keep_ratio, method, magnitude_ratio, uses_dynamic_cache, DynamicCache
                 )
         
         return generated_ids
     
-    def _prune_kv_cache(
+    def _prune_kv_cache_v2(
         self,
         past_key_values,
         keep_ratio: float,
         method: str,
         magnitude_ratio: float = 0.5,
+        uses_dynamic_cache: bool = False,
+        DynamicCache = None,
     ):
         """
         Prune KV cache to keep only important tokens.
         
-        Args:
-            past_key_values: Cache object (DynamicCache or tuple)
-            keep_ratio: Fraction of tokens to keep (e.g., 0.1 for 90% sparsity)
-            method: "h2o" or "cab_v4"
-            magnitude_ratio: For CAB V4
-        
-        Returns:
-            Pruned past_key_values in same format as input
+        Returns: (pruned_cache, kept_indices)
         """
         if past_key_values is None or keep_ratio >= 1.0:
-            return past_key_values
+            return past_key_values, None
         
-        # Check if it's a DynamicCache object
-        is_dynamic_cache = hasattr(past_key_values, 'key_cache')
-        
-        if is_dynamic_cache:
-            # DynamicCache format - access key_cache and value_cache lists
-            from transformers.cache_utils import DynamicCache
+        if uses_dynamic_cache and DynamicCache is not None:
+            # Create a new DynamicCache with pruned values
+            new_cache = DynamicCache()
             
             num_layers = len(past_key_values.key_cache)
+            kept_indices_all = []
             
             for layer_idx in range(num_layers):
                 key = past_key_values.key_cache[layer_idx]
                 value = past_key_values.value_cache[layer_idx]
                 
                 if key is None:
+                    new_cache.update(torch.empty(0), torch.empty(0), layer_idx)
+                    kept_indices_all.append(None)
                     continue
                 
                 B, H, N, D = key.shape
                 num_keep = max(4, int(N * keep_ratio))
                 
                 if N <= num_keep:
+                    # Keep all - just update the new cache
+                    new_cache.update(key, value, layer_idx)
+                    kept_indices_all.append(None)
                     continue
                 
                 # Compute importance
                 importance = self._compute_importance(key, method, magnitude_ratio, num_keep)
                 
-                # Get top-k indices
-                _, top_indices = torch.topk(importance, k=num_keep, dim=-1)
+                # Get top-k indices (use first head's importance for simplicity)
+                importance_flat = importance.mean(dim=1)  # [B, N] - average over heads
+                _, top_indices = torch.topk(importance_flat, k=num_keep, dim=-1)  # [B, num_keep]
                 top_indices, _ = torch.sort(top_indices, dim=-1)
                 
-                # Gather pruned keys and values
-                top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, D)
-                pruned_key = torch.gather(key, 2, top_indices_expanded)
-                pruned_value = torch.gather(value, 2, top_indices_expanded)
+                # Expand for gathering: need [B, H, num_keep, D]
+                top_indices_for_key = top_indices.unsqueeze(1).unsqueeze(-1).expand(-1, H, -1, D)
                 
-                # Update in place
-                past_key_values.key_cache[layer_idx] = pruned_key
-                past_key_values.value_cache[layer_idx] = pruned_value
+                pruned_key = torch.gather(key, 2, top_indices_for_key)
+                pruned_value = torch.gather(value, 2, top_indices_for_key)
+                
+                # Update the new cache
+                new_cache.update(pruned_key, pruned_value, layer_idx)
+                kept_indices_all.append(top_indices)
             
-            return past_key_values
+            return new_cache, kept_indices_all
         
         else:
             # Tuple format
             pruned_kvs = []
+            kept_indices_all = []
             
             for layer_idx, kv in enumerate(past_key_values):
                 key, value = kv
@@ -560,23 +561,42 @@ Answer:"""
                 
                 if N <= num_keep:
                     pruned_kvs.append(kv)
+                    kept_indices_all.append(None)
                     continue
                 
                 # Compute importance
                 importance = self._compute_importance(key, method, magnitude_ratio, num_keep)
                 
                 # Get top-k indices
-                _, top_indices = torch.topk(importance, k=num_keep, dim=-1)
+                importance_flat = importance.mean(dim=1)  # [B, N]
+                _, top_indices = torch.topk(importance_flat, k=num_keep, dim=-1)
                 top_indices, _ = torch.sort(top_indices, dim=-1)
                 
-                # Gather pruned keys and values
-                top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, D)
-                pruned_key = torch.gather(key, 2, top_indices_expanded)
-                pruned_value = torch.gather(value, 2, top_indices_expanded)
+                # Expand for gathering
+                top_indices_for_key = top_indices.unsqueeze(1).unsqueeze(-1).expand(-1, H, -1, D)
+                
+                pruned_key = torch.gather(key, 2, top_indices_for_key)
+                pruned_value = torch.gather(value, 2, top_indices_for_key)
                 
                 pruned_kvs.append((pruned_key, pruned_value))
+                kept_indices_all.append(top_indices)
             
-            return tuple(pruned_kvs)
+            return tuple(pruned_kvs), kept_indices_all
+    
+    def _prune_kv_cache(
+        self,
+        past_key_values,
+        keep_ratio: float,
+        method: str,
+        magnitude_ratio: float = 0.5,
+    ):
+        """Legacy method - use _prune_kv_cache_v2 instead."""
+        result, _ = self._prune_kv_cache_v2(
+            past_key_values, keep_ratio, method, magnitude_ratio,
+            uses_dynamic_cache=hasattr(past_key_values, 'key_cache'),
+            DynamicCache=None
+        )
+        return result
     
     def _compute_importance(
         self,
