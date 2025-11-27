@@ -236,9 +236,10 @@ class BaseSparseAttention(nn.Module):
         # Apply output projection
         output = self._apply_output_projection(attn_output)
         
-        # HuggingFace decoder layers expect exactly 3 outputs:
-        # (hidden_states, attention_weights, past_key_value)
-        # Even if some are None, we must return all 3
+        # HuggingFace LlamaAttention always returns exactly 3 values:
+        # (attn_output, attn_weights, past_key_value)
+        # Even when output_attentions=False, attn_weights is returned as None
+        # Even when use_cache=False, past_key_value is returned as None
         attn_weights = None  # We don't compute explicit attention weights
         
         return output, attn_weights, new_past_key_value
