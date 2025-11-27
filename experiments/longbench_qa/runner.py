@@ -456,7 +456,15 @@ Answer:"""
                     break
             
             # Forward pass with pruned cache
-            cache_len = past_key_values[0][0].shape[2] if past_key_values else 0
+            # Get cache length (handle both DynamicCache and tuple formats)
+            if past_key_values is None:
+                cache_len = 0
+            elif hasattr(past_key_values, 'get_seq_length'):
+                cache_len = past_key_values.get_seq_length()
+            elif hasattr(past_key_values, 'key_cache'):
+                cache_len = past_key_values.key_cache[0].shape[2] if past_key_values.key_cache[0] is not None else 0
+            else:
+                cache_len = past_key_values[0][0].shape[2]
             position_ids = torch.tensor([[cache_len]], device=device)
             
             with torch.no_grad():
@@ -480,97 +488,138 @@ Answer:"""
     
     def _prune_kv_cache(
         self,
-        past_key_values: Tuple,
+        past_key_values,
         keep_ratio: float,
         method: str,
         magnitude_ratio: float = 0.5,
-    ) -> Tuple:
+    ):
         """
         Prune KV cache to keep only important tokens.
         
         Args:
-            past_key_values: Tuple of (key, value) per layer
+            past_key_values: Cache object (DynamicCache or tuple)
             keep_ratio: Fraction of tokens to keep (e.g., 0.1 for 90% sparsity)
             method: "h2o" or "cab_v4"
             magnitude_ratio: For CAB V4
         
         Returns:
-            Pruned past_key_values
+            Pruned past_key_values in same format as input
         """
         if past_key_values is None or keep_ratio >= 1.0:
             return past_key_values
         
-        pruned_kvs = []
+        # Check if it's a DynamicCache object
+        is_dynamic_cache = hasattr(past_key_values, 'key_cache')
         
-        for layer_idx, kv in enumerate(past_key_values):
-            # Handle different cache formats
-            if hasattr(kv, 'key_cache'):
-                # DynamicCache format
-                key = kv.key_cache
-                value = kv.value_cache
-            else:
-                # Tuple format
+        if is_dynamic_cache:
+            # DynamicCache format - access key_cache and value_cache lists
+            from transformers.cache_utils import DynamicCache
+            
+            num_layers = len(past_key_values.key_cache)
+            
+            for layer_idx in range(num_layers):
+                key = past_key_values.key_cache[layer_idx]
+                value = past_key_values.value_cache[layer_idx]
+                
+                if key is None:
+                    continue
+                
+                B, H, N, D = key.shape
+                num_keep = max(4, int(N * keep_ratio))
+                
+                if N <= num_keep:
+                    continue
+                
+                # Compute importance
+                importance = self._compute_importance(key, method, magnitude_ratio, num_keep)
+                
+                # Get top-k indices
+                _, top_indices = torch.topk(importance, k=num_keep, dim=-1)
+                top_indices, _ = torch.sort(top_indices, dim=-1)
+                
+                # Gather pruned keys and values
+                top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, D)
+                pruned_key = torch.gather(key, 2, top_indices_expanded)
+                pruned_value = torch.gather(value, 2, top_indices_expanded)
+                
+                # Update in place
+                past_key_values.key_cache[layer_idx] = pruned_key
+                past_key_values.value_cache[layer_idx] = pruned_value
+            
+            return past_key_values
+        
+        else:
+            # Tuple format
+            pruned_kvs = []
+            
+            for layer_idx, kv in enumerate(past_key_values):
                 key, value = kv
-            
-            B, H, N, D = key.shape
-            num_keep = max(4, int(N * keep_ratio))  # Keep at least 4 tokens
-            
-            if N <= num_keep:
-                pruned_kvs.append(kv)
-                continue
-            
-            # Compute importance scores
-            if method == "h2o":
-                # H2O: Use L2 norm of key vectors as importance
-                importance = key.norm(dim=-1)  # [B, H, N]
-            
-            elif method == "cab_v4":
-                # CAB V4: Hybrid of magnitude + uniqueness
-                magnitude = key.norm(dim=-1)  # [B, H, N]
                 
-                # Compute uniqueness (inverse of redundancy)
-                k_norm = F.normalize(key, dim=-1)
-                # Similarity to other keys
-                sim = torch.matmul(k_norm, k_norm.transpose(-2, -1))  # [B, H, N, N]
-                redundancy = sim.mean(dim=-1)  # [B, H, N]
-                uniqueness = 1.0 - redundancy
+                B, H, N, D = key.shape
+                num_keep = max(4, int(N * keep_ratio))
                 
-                # Normalize both to [0, 1] range
-                mag_norm = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min() + 1e-8)
-                uniq_norm = (uniqueness - uniqueness.min()) / (uniqueness.max() - uniqueness.min() + 1e-8)
+                if N <= num_keep:
+                    pruned_kvs.append(kv)
+                    continue
                 
-                # Combine
-                importance = magnitude_ratio * mag_norm + (1 - magnitude_ratio) * uniq_norm
-            
-            elif method == "streaming_llm":
-                # Keep first 4 tokens (sinks) and last tokens
-                importance = torch.zeros(B, H, N, device=key.device)
-                importance[:, :, :4] = 1e6  # Always keep sinks
-                importance[:, :, -num_keep+4:] = torch.arange(num_keep-4, device=key.device).float()
-            
-            else:  # random
-                importance = torch.rand(B, H, N, device=key.device)
-            
-            # Get top-k indices
-            _, top_indices = torch.topk(importance, k=num_keep, dim=-1)  # [B, H, num_keep]
-            
-            # Sort to maintain order
-            top_indices, _ = torch.sort(top_indices, dim=-1)
-            
-            # Gather pruned keys and values
-            top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, D)
-            pruned_key = torch.gather(key, 2, top_indices_expanded)
-            pruned_value = torch.gather(value, 2, top_indices_expanded)
-            
-            # Return in same format as input
-            if hasattr(kv, 'key_cache'):
-                # DynamicCache - need to create new cache object
-                # For simplicity, return tuple format
+                # Compute importance
+                importance = self._compute_importance(key, method, magnitude_ratio, num_keep)
+                
+                # Get top-k indices
+                _, top_indices = torch.topk(importance, k=num_keep, dim=-1)
+                top_indices, _ = torch.sort(top_indices, dim=-1)
+                
+                # Gather pruned keys and values
+                top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, D)
+                pruned_key = torch.gather(key, 2, top_indices_expanded)
+                pruned_value = torch.gather(value, 2, top_indices_expanded)
+                
                 pruned_kvs.append((pruned_key, pruned_value))
-            else:
-                pruned_kvs.append((pruned_key, pruned_value))
+            
+            return tuple(pruned_kvs)
+    
+    def _compute_importance(
+        self,
+        key: torch.Tensor,
+        method: str,
+        magnitude_ratio: float,
+        num_keep: int,
+    ) -> torch.Tensor:
+        """Compute importance scores for KV cache pruning."""
+        B, H, N, D = key.shape
         
-        return tuple(pruned_kvs)
+        if method == "h2o":
+            # H2O: Use L2 norm of key vectors as importance
+            importance = key.norm(dim=-1)  # [B, H, N]
+        
+        elif method == "cab_v4":
+            # CAB V4: Hybrid of magnitude + uniqueness
+            magnitude = key.norm(dim=-1)  # [B, H, N]
+            
+            # Compute uniqueness (inverse of redundancy)
+            k_norm = F.normalize(key, dim=-1)
+            sim = torch.matmul(k_norm, k_norm.transpose(-2, -1))  # [B, H, N, N]
+            redundancy = sim.mean(dim=-1)  # [B, H, N]
+            uniqueness = 1.0 - redundancy
+            
+            # Normalize both to [0, 1] range
+            mag_norm = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min() + 1e-8)
+            uniq_norm = (uniqueness - uniqueness.min()) / (uniqueness.max() - uniqueness.min() + 1e-8)
+            
+            # Combine
+            importance = magnitude_ratio * mag_norm + (1 - magnitude_ratio) * uniq_norm
+        
+        elif method == "streaming_llm":
+            # Keep first 4 tokens (sinks) and last tokens
+            importance = torch.zeros(B, H, N, device=key.device)
+            importance[:, :, :4] = 1e6  # Always keep sinks
+            if num_keep > 4:
+                importance[:, :, -(num_keep-4):] = torch.arange(num_keep-4, device=key.device).float()
+        
+        else:  # random
+            importance = torch.rand(B, H, N, device=key.device)
+        
+        return importance
     
     def get_attention_weights(
         self,
