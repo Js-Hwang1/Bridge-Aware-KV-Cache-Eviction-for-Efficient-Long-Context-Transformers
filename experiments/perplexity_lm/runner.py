@@ -498,22 +498,36 @@ class PerplexityBenchmarkRunner:
         # Load model
         dtype = getattr(torch, self.config.model.torch_dtype, torch.float16)
         
-        try:
+        # Check if any method requires attention outputs (H2O needs this)
+        needs_eager = "h2o" in self.config.methods
+        
+        if needs_eager:
+            # H2O requires output_attentions=True which only works with eager attention
+            logger.info("H2O method detected - using eager attention for output_attentions support")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.config.model.name,
                 torch_dtype=dtype,
                 device_map=self.config.model.device_map,
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2" if self.config.model.use_flash_attention else None,
+                attn_implementation="eager",
             )
-        except Exception as e:
-            logger.warning(f"Failed to load with flash attention: {e}")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.config.model.name,
-                torch_dtype=dtype,
-                device_map=self.config.model.device_map,
-                trust_remote_code=True,
-            )
+        else:
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.config.model.name,
+                    torch_dtype=dtype,
+                    device_map=self.config.model.device_map,
+                    trust_remote_code=True,
+                    attn_implementation="flash_attention_2" if self.config.model.use_flash_attention else None,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load with flash attention: {e}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.config.model.name,
+                    torch_dtype=dtype,
+                    device_map=self.config.model.device_map,
+                    trust_remote_code=True,
+                )
         
         self.model.eval()
         logger.info(f"Model loaded on {self.device}")
