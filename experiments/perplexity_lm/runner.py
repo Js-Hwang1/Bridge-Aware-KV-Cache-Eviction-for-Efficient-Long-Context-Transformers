@@ -165,32 +165,41 @@ class SparsePerplexityEvaluator:
         input_ids: torch.Tensor,
     ) -> Tuple[float, float, int]:
         """
-        Evaluate using KV cache pruning - matches published H2O/StreamingLLM methodology.
+        Evaluate using KV cache pruning - EXACT published methodology.
+        
+        H2O: Cumulative attention scores (Zhang et al., 2023)
+        StreamingLLM: Sinks + sliding window (Xiao et al., 2023)
+        CAB V4: Hybrid magnitude + uniqueness (Ours)
         """
         from transformers import DynamicCache
         
         B, seq_len = input_ids.shape
         
         # Determine cache size based on sparsity
-        # sparsity=0.9 means keep 10% of tokens
         keep_ratio = 1.0 - self.sparsity
         max_cache_size = max(64, int(seq_len * keep_ratio))
-        
-        # Sink tokens (first 4) and recent window
-        sink_size = 4
         
         total_loss = 0.0
         num_tokens = 0
         past_key_values = None
         
+        # H2O: Track cumulative attention scores per position
+        cumulative_attention = None  # Will be [cache_len] tensor
+        
+        # StreamingLLM parameters (from paper)
+        sink_size = 4  # "attention sinks"
+        
         for i in range(seq_len - 1):
             current_token = input_ids[:, i:i+1]
             
-            # Forward pass with KV cache
+            # Forward pass - H2O needs attention weights
+            need_attention = (self.method == "h2o")
+            
             outputs = self.model(
                 input_ids=current_token,
                 past_key_values=past_key_values,
                 use_cache=True,
+                output_attentions=need_attention,
             )
             
             # Get logits and compute loss for next token
@@ -200,19 +209,41 @@ class SparsePerplexityEvaluator:
             total_loss += loss.item()
             num_tokens += 1
             
-            # Update and prune KV cache
+            # Update KV cache
             past_key_values = outputs.past_key_values
             
+            # H2O: Accumulate attention scores
+            if self.method == "h2o" and outputs.attentions is not None:
+                # attentions: tuple of [B, H, 1, seq_len] per layer
+                # Sum across layers, batch, heads to get per-position score
+                attn_scores = torch.stack(outputs.attentions, dim=0)  # [L, B, H, 1, seq_len]
+                position_scores = attn_scores.sum(dim=(0, 1, 2, 3))  # [seq_len]
+                
+                if cumulative_attention is None:
+                    cumulative_attention = position_scores
+                else:
+                    # Extend cumulative_attention to match new cache length
+                    new_len = position_scores.shape[0]
+                    if cumulative_attention.shape[0] < new_len:
+                        # Pad with zeros for new position
+                        padding = torch.zeros(new_len - cumulative_attention.shape[0], 
+                                            device=cumulative_attention.device)
+                        cumulative_attention = torch.cat([cumulative_attention, padding])
+                    cumulative_attention[:new_len] += position_scores
+            
+            # Prune KV cache if needed
             if past_key_values is not None:
-                # Get cache length - handle both DynamicCache and tuple formats
                 if hasattr(past_key_values, 'get_seq_length'):
                     cache_len = past_key_values.get_seq_length()
                 else:
                     cache_len = past_key_values[0][0].shape[2]
                 
                 if cache_len > max_cache_size:
-                    past_key_values = self._prune_kv_cache_for_eval(
-                        past_key_values, max_cache_size, sink_size
+                    past_key_values, cumulative_attention = self._prune_kv_cache_exact(
+                        past_key_values, 
+                        max_cache_size,
+                        cumulative_attention,
+                        sink_size,
                     )
         
         avg_loss = total_loss / num_tokens if num_tokens > 0 else float("nan")
@@ -220,89 +251,103 @@ class SparsePerplexityEvaluator:
         
         return ppl, avg_loss, num_tokens
     
-    def _prune_kv_cache_for_eval(
+    def _prune_kv_cache_exact(
         self,
         past_key_values,
         max_size: int,
+        cumulative_attention: Optional[torch.Tensor],
         sink_size: int,
     ):
         """
-        Prune KV cache using method-specific importance scoring.
+        Prune KV cache using EXACT published algorithms.
         
-        H2O: L2 norm of keys
-        CAB V4: Hybrid magnitude + uniqueness
-        StreamingLLM: Sinks + recent window
+        H2O (Zhang et al., 2023): 
+            - Evict tokens with LOWEST cumulative attention scores
+            - No sinks, no recent window - pure importance
+            
+        StreamingLLM (Xiao et al., 2023):
+            - Keep first `sink_size` tokens (attention sinks)
+            - Keep most recent tokens to fill remaining budget
+            
+        CAB V4 (Ours):
+            - Hybrid: 50% magnitude + 50% uniqueness
         """
         from transformers import DynamicCache
         
         # Handle DynamicCache vs tuple format
         if hasattr(past_key_values, 'key_cache'):
-            # DynamicCache format
             key_cache = past_key_values.key_cache
             value_cache = past_key_values.value_cache
-            is_dynamic_cache = True
         else:
-            # Tuple format
             key_cache = [layer_kv[0] for layer_kv in past_key_values]
             value_cache = [layer_kv[1] for layer_kv in past_key_values]
-            is_dynamic_cache = False
         
         cache_len = key_cache[0].shape[2]
-        
-        if cache_len <= max_size:
-            return past_key_values
-        
         device = key_cache[0].device
         
-        # Indices to keep
-        if self.method == "streaming_llm":
-            # StreamingLLM: Keep sinks + most recent
-            keep_indices = list(range(sink_size))
-            recent_start = max(sink_size, cache_len - (max_size - sink_size))
-            keep_indices.extend(range(recent_start, cache_len))
-            keep_indices = torch.tensor(keep_indices[:max_size], device=device)
-        else:
-            # H2O / CAB V4: Score by importance, keep top-K
+        if cache_len <= max_size:
+            return past_key_values, cumulative_attention
+        
+        # Method-specific selection
+        if self.method == "h2o":
+            # H2O: Keep tokens with HIGHEST cumulative attention (exact algorithm)
+            if cumulative_attention is not None and len(cumulative_attention) >= cache_len:
+                scores = cumulative_attention[:cache_len]
+                _, keep_indices = torch.topk(scores, k=max_size, largest=True)
+                keep_indices = keep_indices.sort().values
+            else:
+                # Fallback if no attention tracked: keep most recent
+                keep_indices = torch.arange(cache_len - max_size, cache_len, device=device)
+        
+        elif self.method == "streaming_llm":
+            # StreamingLLM: Sinks + recent (exact algorithm from paper)
+            sink_indices = torch.arange(min(sink_size, cache_len), device=device)
+            recent_budget = max_size - len(sink_indices)
+            recent_start = max(sink_size, cache_len - recent_budget)
+            recent_indices = torch.arange(recent_start, cache_len, device=device)
+            keep_indices = torch.cat([sink_indices, recent_indices])
+        
+        elif self.method == "cab_v4":
+            # CAB V4: Hybrid magnitude + uniqueness (our method)
             keys = key_cache[0]  # [B, H, cache_len, D]
             
-            if self.method == "h2o":
-                # H2O: L2 norm
-                importance = keys.norm(dim=-1).mean(dim=(0, 1))  # [cache_len]
-            else:  # cab_v4
-                # CAB V4: Hybrid magnitude + uniqueness
-                magnitude = keys.norm(dim=-1).mean(dim=(0, 1))  # [cache_len]
-                
-                # Uniqueness (simplified)
-                keys_flat = keys.mean(dim=(0, 1))  # [cache_len, D]
-                keys_norm = F.normalize(keys_flat, dim=-1)
-                similarity = torch.mm(keys_norm, keys_norm.t())
-                redundancy = similarity.mean(dim=-1)
-                uniqueness = 1.0 - redundancy
-                
-                # Normalize
-                mag_norm = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min() + 1e-8)
-                uniq_norm = (uniqueness - uniqueness.min()) / (uniqueness.max() - uniqueness.min() + 1e-8)
-                
-                importance = 0.5 * mag_norm + 0.5 * uniq_norm
+            # Magnitude: L2 norm
+            magnitude = keys.norm(dim=-1).mean(dim=(0, 1))  # [cache_len]
             
-            # Keep sinks + top-K from rest
-            sink_indices = torch.arange(sink_size, device=device)
+            # Uniqueness: 1 - avg cosine similarity
+            keys_flat = keys.mean(dim=(0, 1))  # [cache_len, D]
+            keys_norm = F.normalize(keys_flat, dim=-1)
+            similarity = torch.mm(keys_norm, keys_norm.t())
+            redundancy = similarity.mean(dim=-1)
+            uniqueness = 1.0 - redundancy
             
-            remaining_budget = max_size - sink_size
-            remaining_importance = importance[sink_size:]
-            _, top_remaining = torch.topk(remaining_importance, k=min(remaining_budget, len(remaining_importance)))
-            top_remaining = top_remaining + sink_size
+            # Normalize to [0, 1]
+            mag_norm = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min() + 1e-8)
+            uniq_norm = (uniqueness - uniqueness.min()) / (uniqueness.max() - uniqueness.min() + 1e-8)
             
-            keep_indices = torch.cat([sink_indices, top_remaining.sort().values])
+            # Hybrid: 50% magnitude + 50% uniqueness
+            importance = 0.5 * mag_norm + 0.5 * uniq_norm
+            
+            _, keep_indices = torch.topk(importance, k=max_size, largest=True)
+            keep_indices = keep_indices.sort().values
         
-        # Prune each layer and create new DynamicCache
+        else:
+            # Unknown method: keep most recent
+            keep_indices = torch.arange(cache_len - max_size, cache_len, device=device)
+        
+        # Prune cache
         new_cache = DynamicCache()
         for layer_idx in range(len(key_cache)):
             pruned_key = key_cache[layer_idx][:, :, keep_indices, :]
             pruned_value = value_cache[layer_idx][:, :, keep_indices, :]
             new_cache.update(pruned_key, pruned_value, layer_idx)
         
-        return new_cache
+        # Prune cumulative attention scores too
+        new_cumulative = None
+        if cumulative_attention is not None:
+            new_cumulative = cumulative_attention[keep_indices]
+        
+        return new_cache, new_cumulative
     
     @torch.no_grad()
     def evaluate_dataset(
