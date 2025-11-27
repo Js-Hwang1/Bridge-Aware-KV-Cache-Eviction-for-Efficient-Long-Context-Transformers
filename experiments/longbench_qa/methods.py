@@ -169,9 +169,16 @@ class H2OAttention(BaseAttentionMethod):
     H2O: Heavy-Hitter Oracle - Magnitude-based selection.
     
     Paper: "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models"
+    Authors: Zhang et al., 2023
+    arXiv: https://arxiv.org/abs/2306.14048
     
-    Strategy: Keep tokens with highest cumulative attention scores.
-    This is the primary baseline for comparison with CAB.
+    Algorithm (faithful to paper):
+    - Track CUMULATIVE attention scores across all tokens
+    - Evict tokens with LOWEST cumulative attention
+    - "Heavy hitters" (tokens that receive high attention) are preserved
+    
+    Key insight: Some tokens consistently receive more attention (heavy hitters),
+    while others are rarely attended to and can be safely evicted.
     """
     
     def modify_attention_weights(
@@ -556,13 +563,16 @@ class StreamingLLMAttention(BaseAttentionMethod):
     StreamingLLM: Attention Sinks + Recent Tokens.
     
     Paper: "Efficient Streaming Language Models with Attention Sinks"
+    Authors: Xiao et al., 2023
+    arXiv: https://arxiv.org/abs/2309.17453
     
-    Strategy:
-    - Always keep first K tokens (attention sinks)
-    - Always keep last W tokens (recent context window)
-    - Prune everything in between
+    Algorithm (faithful to paper):
+    - Keep first K tokens ("attention sinks" - usually 4 tokens)
+    - Keep last W tokens (sliding window for recent context)
+    - Evict all tokens in between
     
-    This is a simple but effective baseline for streaming scenarios.
+    Key insight: Initial tokens act as "sinks" that absorb attention mass,
+    and are critical for model stability even if semantically unimportant.
     """
     
     def modify_attention_weights(
@@ -651,11 +661,17 @@ class LocalStridedAttention(BaseAttentionMethod):
     """
     Local + Strided Attention Pattern.
     
-    Combines:
-    - Local window attention (attend to nearby tokens)
-    - Strided attention (attend to every Nth token globally)
+    Paper: "Generating Long Sequences with Sparse Transformers"
+    Authors: Child et al., 2019
+    arXiv: https://arxiv.org/abs/1904.10509
     
-    This is a common baseline pattern used in Sparse Transformer, BigBird, etc.
+    Algorithm (faithful to paper):
+    - Local window: Each query attends to nearby keys within window W
+    - Strided pattern: Each query also attends to every S-th token globally
+    - Union of both patterns determines the final sparse mask
+    
+    Key insight: Combining local and strided patterns captures both
+    local dependencies and long-range periodic patterns.
     """
     
     def modify_attention_weights(
