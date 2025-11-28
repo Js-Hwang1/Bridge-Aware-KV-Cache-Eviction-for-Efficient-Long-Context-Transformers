@@ -655,7 +655,13 @@ Answer:"""
         if (is_h2o or is_cab):
             if getattr(self, 'use_heuristic_scoring', False):
                 # Heuristic scoring: Use KV cache magnitudes (fast, no attention weights needed)
+                logger.info(f"[DEBUG] Using heuristic scoring for importance")
                 cumulative_attention = self._compute_heuristic_importance(past_key_values)
+                if cumulative_attention is not None:
+                    logger.info(f"[DEBUG] Heuristic importance computed: shape={cumulative_attention.shape}, "
+                               f"range=[{cumulative_attention.min():.2f}, {cumulative_attention.max():.2f}]")
+                else:
+                    logger.warning(f"[DEBUG] Heuristic importance returned None!")
             elif use_flash:
                 # Extract from Flash Attention layers (O(N) memory, 50x less!)
                 cumulative_attention = self._get_flash_cumulative_scores()
@@ -720,9 +726,13 @@ Answer:"""
             if (is_h2o or is_cab) and will_prune:
                 if getattr(self, 'use_heuristic_scoring', False):
                     # Heuristic scoring: Recompute from current KV cache (fast)
+                    logger.info(f"[DEBUG] Recomputing heuristic scores at step {step}")
                     heuristic_scores = self._compute_heuristic_importance(past_key_values)
                     if heuristic_scores is not None:
                         cumulative_attention = heuristic_scores
+                        logger.info(f"[DEBUG] Updated heuristic scores: shape={cumulative_attention.shape}")
+                    else:
+                        logger.warning(f"[DEBUG] Heuristic scores returned None at step {step}")
                 elif use_flash:
                     # Flash Attention: Get cumulative scores (already accumulated automatically)
                     flash_scores = self._get_flash_cumulative_scores()
