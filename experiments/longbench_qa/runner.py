@@ -247,10 +247,15 @@ class ModelWrapper:
         }
         
         # Try to use optimized attention implementations
-        # NOTE: CAB and H2O require eager attention to capture attention weights
+        # For CAB/H2O: Use SDPA with heuristic scoring (no need for eager attention)
         if force_eager_attention:
-            model_kwargs['attn_implementation'] = 'eager'
-            logger.info("Using eager attention (required for CAB/H2O to capture attention weights)")
+            # Use SDPA for speed - heuristic scoring doesn't need attention weights
+            if TORCH_AVAILABLE and hasattr(F, 'scaled_dot_product_attention'):
+                model_kwargs['attn_implementation'] = 'sdpa'
+                logger.info("Using SDPA for CAB/H2O (heuristic-based importance scoring)")
+            else:
+                model_kwargs['attn_implementation'] = 'eager'
+                logger.info("SDPA not available, using eager attention")
         elif self.config.use_flash_attention:
             try:
                 import flash_attn
@@ -284,23 +289,17 @@ class ModelWrapper:
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # Replace attention with Flash Attention if using CAB/H2O methods
-        # Uses monkey-patching to inject Flash Attention into HF attention modules
+        # For CAB/H2O, use SDPA with heuristic-based importance scoring
+        # This avoids the complexity of custom Flash Attention while maintaining speed
         if force_eager_attention:
-            try:
-                from cab_attention.kernels.flash_attention_accumulate import replace_attention_with_flash
-                logger.info("Patching attention modules with Flash Attention + cumulative score tracking...")
-                self.model = replace_attention_with_flash(self.model)
-                self.use_flash_attention = True
-                logger.info("Flash Attention integration complete (3-4x faster, 50x less memory)")
-            except ImportError as e:
-                logger.warning(f"Flash Attention not available: {e}. Using eager attention (slower).")
-                self.use_flash_attention = False
-            except Exception as e:
-                logger.error(f"Flash Attention patching failed: {e}. Using eager attention.")
-                self.use_flash_attention = False
+            # Use SDPA (proven fast attention) instead of custom Flash Attention
+            # Importance scoring will use heuristics (key magnitudes) instead of exact attention weights
+            logger.info("Using SDPA with heuristic-based importance scoring for CAB/H2O")
+            self.use_flash_attention = False
+            self.use_heuristic_scoring = True
         else:
             self.use_flash_attention = False
+            self.use_heuristic_scoring = False
 
         self.model.eval()
         self._loaded = True
@@ -524,6 +523,75 @@ Answer:"""
         except ImportError:
             return None
 
+    def _compute_heuristic_importance(self, past_key_values) -> Optional[torch.Tensor]:
+        """
+        Compute heuristic importance scores from KV cache magnitudes.
+
+        This is a fast approximation that doesn't require attention weights.
+        We use the L2 norm of key and value vectors as an importance measure.
+
+        Args:
+            past_key_values: KV cache (DynamicCache or tuple of tuples)
+
+        Returns:
+            Tensor of shape [cache_len] with importance scores per position,
+            or None if heuristic scoring is not enabled.
+        """
+        if not getattr(self, 'use_heuristic_scoring', False):
+            return None
+
+        if past_key_values is None:
+            return None
+
+        try:
+            # Handle DynamicCache
+            if hasattr(past_key_values, 'key_cache'):
+                keys = past_key_values.key_cache
+                values = past_key_values.value_cache
+            # Handle tuple of tuples [(key, value), ...]
+            elif isinstance(past_key_values, tuple):
+                keys = [kv[0] for kv in past_key_values]
+                values = [kv[1] for kv in past_key_values]
+            else:
+                return None
+
+            # Compute importance scores across all layers
+            aggregated = None
+
+            for layer_idx, (key_layer, value_layer) in enumerate(zip(keys, values)):
+                # key_layer: [B, num_heads, seq_len, head_dim]
+                # value_layer: [B, num_heads, seq_len, head_dim]
+
+                # Compute L2 norm per position (across head_dim)
+                key_norms = torch.norm(key_layer, p=2, dim=-1)  # [B, num_heads, seq_len]
+                value_norms = torch.norm(value_layer, p=2, dim=-1)  # [B, num_heads, seq_len]
+
+                # Combine key and value importance
+                layer_importance = key_norms + value_norms  # [B, num_heads, seq_len]
+
+                # Sum over batch and heads
+                layer_contrib = layer_importance.sum(dim=(0, 1))  # [seq_len]
+
+                if aggregated is None:
+                    aggregated = layer_contrib
+                else:
+                    # Handle different cache lengths across layers
+                    max_len = max(len(aggregated), len(layer_contrib))
+                    if len(aggregated) < max_len:
+                        padding = torch.zeros(max_len - len(aggregated), device=aggregated.device)
+                        aggregated = torch.cat([aggregated, padding])
+                    if len(layer_contrib) < max_len:
+                        padding = torch.zeros(max_len - len(layer_contrib), device=layer_contrib.device)
+                        layer_contrib = torch.cat([layer_contrib, padding])
+
+                    aggregated += layer_contrib
+
+            return aggregated
+
+        except Exception as e:
+            logger.warning(f"Failed to compute heuristic importance: {e}")
+            return None
+
     def _sparse_generate(
         self,
         inputs: Dict[str, torch.Tensor],
@@ -585,7 +653,10 @@ Answer:"""
 
         # H2O/CAB: Initialize cumulative attention from first pass
         if (is_h2o or is_cab):
-            if use_flash:
+            if getattr(self, 'use_heuristic_scoring', False):
+                # Heuristic scoring: Use KV cache magnitudes (fast, no attention weights needed)
+                cumulative_attention = self._compute_heuristic_importance(past_key_values)
+            elif use_flash:
                 # Extract from Flash Attention layers (O(N) memory, 50x less!)
                 cumulative_attention = self._get_flash_cumulative_scores()
             elif outputs.attentions is not None:
@@ -647,7 +718,12 @@ Answer:"""
 
             # H2O/CAB: Accumulate attention scores (only on pruning steps)
             if (is_h2o or is_cab) and will_prune:
-                if use_flash:
+                if getattr(self, 'use_heuristic_scoring', False):
+                    # Heuristic scoring: Recompute from current KV cache (fast)
+                    heuristic_scores = self._compute_heuristic_importance(past_key_values)
+                    if heuristic_scores is not None:
+                        cumulative_attention = heuristic_scores
+                elif use_flash:
                     # Flash Attention: Get cumulative scores (already accumulated automatically)
                     flash_scores = self._get_flash_cumulative_scores()
                     if flash_scores is not None:
