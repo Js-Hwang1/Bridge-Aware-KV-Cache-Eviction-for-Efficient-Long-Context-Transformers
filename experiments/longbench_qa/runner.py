@@ -477,6 +477,19 @@ Answer:"""
 
         return prompt
 
+    def _reset_flash_cumulative_scores(self) -> None:
+        """
+        Reset cumulative attention scores in all Flash Attention layers.
+        CRITICAL: Must be called before each new sample to avoid score contamination.
+        """
+        if not getattr(self, 'use_flash_attention', False):
+            return
+
+        # Reset scores in all attention modules
+        for layer in self.model.model.layers:
+            if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, '_flash_cumulative_scores'):
+                layer.self_attn._flash_cumulative_scores = None
+
     def _get_flash_cumulative_scores(self) -> Optional[torch.Tensor]:
         """
         Extract cumulative attention scores from Flash Attention layers.
@@ -625,11 +638,16 @@ Answer:"""
         cumulative_attention = None  # Will be [cache_len] tensor
         is_h2o = (method == "h2o")
         is_cab = (method == "cab")
-        
+
+        # CRITICAL: Reset Flash Attention cumulative scores before each sample
+        # Without this reset, scores accumulate across samples → wrong eviction → gibberish
+        use_flash = getattr(self, 'use_flash_attention', False)
+        if use_flash and (is_h2o or is_cab):
+            self._reset_flash_cumulative_scores()
+
         # Initial forward pass to get KV cache
         # For H2O/CAB: Need attention on first pass to initialize cumulative scores
         # If using Flash Attention, scores are accumulated automatically (no output_attentions needed)
-        use_flash = getattr(self, 'use_flash_attention', False)
 
         with torch.no_grad():
             outputs = self.model(
