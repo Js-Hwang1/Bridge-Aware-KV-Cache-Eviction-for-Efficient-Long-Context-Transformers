@@ -530,7 +530,7 @@ class ModelConfig:
     device_map: str = "auto"
     
     # Tokenizer settings
-    max_length: int = 4096
+    max_length: int = 32768  # Support full long contexts (~30K tokens for NarrativeQA)
     truncation_side: str = "left"         # Truncate from left for long contexts
     
     # Generation settings
