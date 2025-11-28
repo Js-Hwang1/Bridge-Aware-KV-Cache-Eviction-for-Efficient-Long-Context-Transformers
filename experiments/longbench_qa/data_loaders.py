@@ -163,16 +163,21 @@ class BaseBenchmarkDataset(TorchDataset, ABC):
             self.samples = [self._preprocess_sample(sample, idx) 
                            for idx, sample in enumerate(raw_data)]
             
-            # Apply max_samples limit
-            if self.config.max_samples:
-                self.samples = self.samples[:self.config.max_samples]
-            
-            # Cache preprocessed data
+            # Cache preprocessed data (BEFORE applying max_samples so cache is complete)
             self._save_to_cache(cache_file)
+        
+        # Apply max_samples limit AFTER loading (whether from cache or fresh)
+        if self.config.max_samples:
+            self.samples = self.samples[:self.config.max_samples]
     
     def _get_cache_path(self) -> Path:
-        """Get cache file path based on config hash."""
-        config_str = f"{self.config.name}_{self.config.split}_{self.config.max_samples}"
+        """Get cache file path based on config hash.
+        
+        Note: max_samples is NOT included in hash since we cache full data
+        and slice afterwards. This allows reusing cache across different
+        max_samples values.
+        """
+        config_str = f"{self.config.name}_{self.config.split}"
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
         cache_dir = Path(self.cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)

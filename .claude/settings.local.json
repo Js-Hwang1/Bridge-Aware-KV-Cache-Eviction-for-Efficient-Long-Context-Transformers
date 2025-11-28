@@ -26,7 +26,8 @@
       "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no anaheim-covered-restored-versus.trycloudflare.com \"cd ~/FRC && git pull origin main\")",
       "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no anaheim-covered-restored-versus.trycloudflare.com \"cd ~/FRC && python -c \"\"\nfrom transformers import AutoModelForCausalLM\nimport torch\n\nmodel = AutoModelForCausalLM.from_pretrained(\n    ''''Qwen/Qwen2.5-7B-Instruct'''',\n    torch_dtype=torch.float16,\n    device_map=''''cpu'''',\n    trust_remote_code=True,\n)\n\nattn = model.model.layers[0].self_attn\nprint(''''Attention module type:'''', type(attn).__name__)\nprint(''''\\nAttributes:'''')\nfor attr in dir(attn):\n    if not attr.startswith(''''_''''):\n        print(f''''  {attr}'''')\n\nprint(''''\\nChecking specific attributes:'''')\nfor attr in [''''q_proj'''', ''''k_proj'''', ''''v_proj'''', ''''o_proj'''', ''''num_heads'''', ''''head_dim'''', ''''qkv_proj'''']:\n    print(f''''  has {attr}: {hasattr(attn, attr)}'''')\n\"\"\")",
       "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no hobbies-standards-customise-relocation.trycloudflare.com \"cd ~/FRC && git pull origin main\":*)",
-      "Bash(sshpass:*)"
+      "Bash(sshpass:*)",
+      "Bash(tee:*)"
     ],
     "deny": [],
     "ask": []

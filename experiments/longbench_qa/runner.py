@@ -1098,13 +1098,13 @@ class BenchmarkRunner:
             logger.info(f"Dataset: {dataset_name}")
             logger.info(f"{'='*60}")
             
-            # Load dataset
-            dataset = get_dataset(dataset_name)
+            # Load dataset with proper config (including max_samples!)
             dataset_config = self.config.dataset_configs.get(
                 dataset_name, ALL_DATASETS.get(dataset_name)
             )
+            dataset = get_dataset(dataset_name, config=dataset_config)
             
-            logger.info(f"Loaded {len(dataset)} samples")
+            logger.info(f"Loaded {len(dataset)} samples (max_samples={dataset_config.max_samples})")
             
             # Run for each method
             for method_name in self.config.methods:
@@ -1174,14 +1174,30 @@ class BenchmarkRunner:
         sample_results = []
         start_time = time.time()
         
-        for sample in tqdm(dataset, desc=f"Evaluating {method_name}"):
+        # Use tqdm with explicit total and position for better display
+        total_samples = len(dataset)
+        pbar = tqdm(
+            enumerate(dataset), 
+            total=total_samples,
+            desc=f"{method_name}@{sparsity:.0%}",
+            leave=True,
+            dynamic_ncols=True,
+        )
+        
+        for idx, sample in pbar:
             try:
                 result = self._evaluate_sample(sample, method, dataset_config)
                 sample_results.append(result)
+                
+                # Update progress bar with current metrics
+                if sample_results:
+                    latest_f1 = result.metrics.get('f1', 0)
+                    pbar.set_postfix({'f1': f'{latest_f1:.3f}', 'done': len(sample_results)})
             except Exception as e:
                 logger.warning(f"Error evaluating sample {sample.sample_id}: {e}")
                 continue
         
+        pbar.close()
         total_time = time.time() - start_time
         
         # Aggregate metrics
