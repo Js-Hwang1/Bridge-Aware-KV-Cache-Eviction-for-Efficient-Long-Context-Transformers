@@ -236,6 +236,7 @@ class ModelWrapper:
         # Try to use optimized attention implementations
         # NOTE: CAB and H2O require eager attention to capture attention weights
         if force_eager_attention:
+            model_kwargs['attn_implementation'] = 'eager'
             logger.info("Using eager attention (required for CAB/H2O to capture attention weights)")
         elif self.config.use_flash_attention:
             try:
