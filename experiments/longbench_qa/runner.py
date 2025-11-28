@@ -531,7 +531,7 @@ Answer:"""
         We use the L2 norm of key and value vectors as an importance measure.
 
         Args:
-            past_key_values: KV cache (DynamicCache or tuple of tuples)
+            past_key_values: KV cache - tuple/list of (key, value) pairs per layer
 
         Returns:
             Tensor of shape [cache_len] with importance scores per position,
@@ -540,25 +540,18 @@ Answer:"""
         if not getattr(self, 'use_heuristic_scoring', False):
             return None
 
-        if past_key_values is None:
+        if past_key_values is None or len(past_key_values) == 0:
             return None
 
         try:
-            # Handle DynamicCache
-            if hasattr(past_key_values, 'key_cache'):
-                keys = past_key_values.key_cache
-                values = past_key_values.value_cache
-            # Handle tuple of tuples [(key, value), ...]
-            elif isinstance(past_key_values, tuple):
-                keys = [kv[0] for kv in past_key_values]
-                values = [kv[1] for kv in past_key_values]
-            else:
-                return None
+            # past_key_values is a tuple/list of (key, value) pairs
+            # Each layer: (key: [B, H, N, D], value: [B, H, N, D])
 
-            # Compute importance scores across all layers
             aggregated = None
 
-            for layer_idx, (key_layer, value_layer) in enumerate(zip(keys, values)):
+            for layer_idx in range(len(past_key_values)):
+                key_layer, value_layer = past_key_values[layer_idx]
+
                 # key_layer: [B, num_heads, seq_len, head_dim]
                 # value_layer: [B, num_heads, seq_len, head_dim]
 
@@ -575,7 +568,7 @@ Answer:"""
                 if aggregated is None:
                     aggregated = layer_contrib
                 else:
-                    # Handle different cache lengths across layers
+                    # Handle different cache lengths across layers (shouldn't happen but be safe)
                     max_len = max(len(aggregated), len(layer_contrib))
                     if len(aggregated) < max_len:
                         padding = torch.zeros(max_len - len(aggregated), device=aggregated.device)
