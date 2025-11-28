@@ -96,6 +96,13 @@ def _flash_attention_fwd_kernel(
         # This is local attention - only for this tile
         qk = tl.dot(q_block, tl.trans(k_block)) * softmax_scale
 
+        # CRITICAL: Mask invalid positions to -inf BEFORE softmax
+        # When N < BLOCK_N, we load zeros for masked positions.
+        # These zeros create attention scores of 0, which should be -inf for softmax.
+        # Without this mask, softmax incorrectly includes padding in the denominator.
+        valid_mask = (q_offs[:, None] < N_q) & (k_offs[None, :] < N_k)
+        qk = tl.where(valid_mask, qk, float('-inf'))
+
         # Apply causal mask if needed (for decoder)
         # qk = tl.where(q_offs[:, None] >= k_offs[None, :], qk, float('-inf'))
 
