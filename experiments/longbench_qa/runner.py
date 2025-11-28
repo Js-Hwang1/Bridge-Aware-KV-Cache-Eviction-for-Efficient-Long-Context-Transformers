@@ -247,11 +247,11 @@ class ModelWrapper:
         }
         
         # Try to use optimized attention implementations
-        # For CAB/H2O: Use eager attention to get real attention weights
+        # For CAB/H2O: Use eager attention initially, then patch with our custom Flash Attention
         if force_eager_attention:
-            # Use eager attention - slower but provides accurate attention weights
+            # Load with eager attention first (will be patched with Flash Attention after loading)
             model_kwargs['attn_implementation'] = 'eager'
-            logger.info("Using eager attention for CAB/H2O (provides attention weights for accurate eviction)")
+            logger.info("Loading with eager attention (will patch with custom Flash Attention for CAB/H2O)")
         elif self.config.use_flash_attention:
             try:
                 import flash_attn
@@ -285,11 +285,19 @@ class ModelWrapper:
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # For CAB/H2O with eager attention, we'll use real attention weights (not heuristics)
+        # For CAB/H2O: Patch model with custom Flash Attention
         if force_eager_attention:
-            logger.info("CAB/H2O will use real attention weights from eager attention")
-            self.use_flash_attention = False
-            self.use_heuristic_scoring = False  # Use real attention weights, not heuristics
+            try:
+                from cab_attention.kernels.flash_attention_accumulate import replace_attention_with_flash
+                logger.info("Patching model with custom Flash Attention for CAB/H2O...")
+                self.model = replace_attention_with_flash(self.model)
+                self.use_flash_attention = True  # Enable Flash Attention flag
+                self.use_heuristic_scoring = False  # Use cumulative scores from Flash Attention
+                logger.info("✓ Custom Flash Attention enabled - will use cumulative scores for eviction")
+            except Exception as e:
+                logger.warning(f"Failed to patch with Flash Attention, falling back to eager: {e}")
+                self.use_flash_attention = False
+                self.use_heuristic_scoring = False  # Will try to use attention weights from eager
         else:
             self.use_flash_attention = False
             self.use_heuristic_scoring = False
