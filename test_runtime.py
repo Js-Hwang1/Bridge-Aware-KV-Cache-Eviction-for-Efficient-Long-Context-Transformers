@@ -32,6 +32,8 @@ def benchmark_cache(cache_class, name, num_tokens=1000, num_layers=32):
     eviction_times = []
 
     for step in range(num_tokens):
+        prev_evictions = cache.total_evictions
+
         # Generate random key/value for each layer
         for layer_idx in range(num_layers):
             key_state = torch.randn(B, H, 1, D, device=device)
@@ -44,14 +46,17 @@ def benchmark_cache(cache_class, name, num_tokens=1000, num_layers=32):
                 attention = torch.rand(B, H, 1, cache_len, device=device)
                 attention = attention / attention.sum(dim=-1, keepdim=True)
 
-            # Track eviction time
-            evict_start = time.time()
-            keys, values = cache.update(key_state, value_state, layer_idx, attention)
-            evict_time = (time.time() - evict_start) * 1000
+            # Track eviction time for FIRST layer update (when eviction happens)
+            if layer_idx == 0:
+                evict_start = time.time()
+                keys, values = cache.update(key_state, value_state, layer_idx, attention)
+                evict_time = (time.time() - evict_start) * 1000
 
-            # Only track when eviction happens
-            if layer_idx == 0 and cache.tokens_since_last_eviction == 0:
-                eviction_times.append(evict_time)
+                # Check if eviction happened
+                if cache.total_evictions > prev_evictions:
+                    eviction_times.append(evict_time)
+            else:
+                keys, values = cache.update(key_state, value_state, layer_idx, attention)
 
         # Progress
         if (step + 1) % 100 == 0:
@@ -78,12 +83,15 @@ def benchmark_cache(cache_class, name, num_tokens=1000, num_layers=32):
     # Complexity check
     print(f"\nComplexity Analysis:")
     if eviction_times:
+        max_size = getattr(cache, 'max_cache_size', getattr(cache.config, 'max_cache_size', 512))
         print(f"  Eviction time should be O(N log N) for topk")
-        print(f"  With N~{cache.max_cache_size}, expecting <10ms per eviction")
+        print(f"  With N~{max_size}, expecting <10ms per eviction")
         if avg_eviction < 20:
             print(f"  ✓ PASS: Avg eviction {avg_eviction:.2f}ms is acceptable")
         else:
             print(f"  ✗ WARNING: Avg eviction {avg_eviction:.2f}ms may be too slow")
+    else:
+        print(f"  No evictions occurred during test")
 
 
 if __name__ == "__main__":
