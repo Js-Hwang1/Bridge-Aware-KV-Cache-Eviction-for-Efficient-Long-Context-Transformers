@@ -122,7 +122,12 @@ class H2OCache:
         if len(self.key_cache) == 0 or self.key_cache[0] is None:
             return
 
-        cache_len = self.key_cache[0].shape[2]
+        # Get minimum cache length across all layers (handles async updates)
+        cache_len = min(
+            self.key_cache[i].shape[2]
+            for i in range(len(self.key_cache))
+            if self.key_cache[i] is not None
+        )
 
         # Compute target size
         keep_ratio = 1.0 - self.sparsity

@@ -4,7 +4,7 @@ CAB KV Cache: Three-Component Eviction
 
 Efficient KV cache with dynamic eviction using:
 1. Local context (recent tokens for fluency)
-2. Bridge tokens (low FRC connectors for reasoning chains)
+2. Bridge tokens (attention-based connectivity to important positions)
 3. Important tokens (high cumulative attention, H2O-style)
 """
 
@@ -12,7 +12,7 @@ import torch
 from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 
-from ..scoring import ImportanceTracker, FRCTracker
+from ..scoring import ImportanceTracker
 from ..eviction import ThreeComponentEvictionPolicy, EvictionConfig
 
 
@@ -98,7 +98,6 @@ class CABCache:
 
         # Scoring trackers
         self.importance_tracker = ImportanceTracker(device=device)
-        self.frc_tracker = FRCTracker(device=device, use_triton=self.config.use_triton)
 
         # Eviction policy
         eviction_config = EvictionConfig(
@@ -110,7 +109,6 @@ class CABCache:
 
         # State tracking
         self.tokens_since_last_eviction = 0
-        self.evictions_since_frc_update = 0
         self.total_evictions = 0
 
         # Statistics
@@ -196,23 +194,12 @@ class CABCache:
         if cache_len <= keep_size:
             return  # No eviction needed
 
-        # Update FRC scores if needed
-        force_frc_update = (self.evictions_since_frc_update >= self.config.frc_update_interval)
-
-        if force_frc_update or self.frc_tracker.frc_scores is None:
-            # Compute FRC from first layer keys
-            self.frc_tracker.compute_from_keys(
-                self.key_cache[0],
-                force_update=True
-            )
-            self.evictions_since_frc_update = 0
-
-        # Select indices to keep
+        # Select indices to keep (bridge selection uses importance-based heuristic)
         keep_indices, diagnostics = self.eviction_policy.select_indices(
             cache_len=cache_len,
             keep_size=keep_size,
             importance_scores=self.importance_tracker.get_scores(),
-            frc_scores=self.frc_tracker.get_scores(),
+            attention_matrix=None,  # Use O(N) heuristic instead of O(N²) computation
             device=self.config.device,
         )
 
@@ -224,11 +211,9 @@ class CABCache:
 
         # Prune trackers
         self.importance_tracker.prune(keep_indices)
-        self.frc_tracker.prune(keep_indices)
 
         # Update state
         self.tokens_since_last_eviction = 0
-        self.evictions_since_frc_update += 1
         self.total_evictions += 1
 
         # Update stats
@@ -255,9 +240,7 @@ class CABCache:
         self.key_cache = []
         self.value_cache = []
         self.importance_tracker.reset()
-        self.frc_tracker.reset()
         self.tokens_since_last_eviction = 0
-        self.evictions_since_frc_update = 0
         self.total_evictions = 0
 
     def get_stats(self) -> Dict[str, Any]:

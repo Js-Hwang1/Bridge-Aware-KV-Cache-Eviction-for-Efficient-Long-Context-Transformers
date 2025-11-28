@@ -8,7 +8,10 @@
       "Bash(cat:*)",
       "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no exams-yen-curtis-amazing.trycloudflare.com \"cat > /root/FRC/cab_attention/cache/cab_cache.py\")",
       "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no exams-yen-curtis-amazing.trycloudflare.com \"cd /root/FRC && python test_fixes.py\")",
-      "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no exams-yen-curtis-amazing.trycloudflare.com \"cd /root/FRC && CUDA_LAUNCH_BLOCKING=1 python test_fixes.py 2>&1 | head -100\")"
+      "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no exams-yen-curtis-amazing.trycloudflare.com \"cd /root/FRC && CUDA_LAUNCH_BLOCKING=1 python test_fixes.py 2>&1 | head -100\")",
+      "Bash(sshpass -p '1234' ssh -o StrictHostKeyChecking=no rides-roster-jimmy-viewing.trycloudflare.com \"cat > /root/FRC/cab_attention/eviction/policy.py\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []

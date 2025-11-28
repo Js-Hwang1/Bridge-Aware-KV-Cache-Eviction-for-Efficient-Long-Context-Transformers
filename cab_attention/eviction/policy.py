@@ -42,7 +42,7 @@ class ThreeComponentEvictionPolicy:
         cache_len: int,
         keep_size: int,
         importance_scores: Optional[torch.Tensor],
-        frc_scores: Optional[torch.Tensor],
+        attention_matrix: Optional[torch.Tensor] = None,
         device: str = 'cuda',
     ) -> Tuple[torch.Tensor, dict]:
         """
@@ -52,7 +52,7 @@ class ThreeComponentEvictionPolicy:
             cache_len: Current cache length
             keep_size: Total number of tokens to keep
             importance_scores: [cache_len] H2O-style cumulative attention
-            frc_scores: [cache_len] FRC scores (lower = bridge)
+            attention_matrix: [cache_len, cache_len] attention matrix for bridge detection
             device: Device for tensor operations
 
         Returns:
@@ -118,45 +118,72 @@ class ThreeComponentEvictionPolicy:
         if len(importance_indices) > 0:
             selected_mask[importance_indices] = True
 
-        # Component 3: Bridge tokens (LOWEST FRC)
-        if frc_scores is not None and bridge_budget > 0:
-            # Ensure frc_scores matches cache_len
-            if len(frc_scores) != cache_len:
-                # Pad or truncate to match cache_len
-                if len(frc_scores) < cache_len:
-                    # Pad with high values (so they won't be selected as bridges)
-                    padding = torch.full(
-                        (cache_len - len(frc_scores),),
-                        float('inf'),
-                        device=device,
-                        dtype=frc_scores.dtype
-                    )
-                    frc_scores = torch.cat([frc_scores, padding])
+        # Component 3: Bridge tokens
+        if bridge_budget > 0:
+            if attention_matrix is not None and len(importance_indices) > 0:
+                # O(N*K) attention-based bridge selection (when matrix available)
+                # Connectivity from important positions to this position
+                connectivity_from = attention_matrix[importance_indices, :].sum(dim=0)  # [cache_len]
+
+                # Connectivity from this position to important positions
+                connectivity_to = attention_matrix[:, importance_indices].sum(dim=1)  # [cache_len]
+
+                # Bridge score: high bidirectional flow with important positions
+                bridge_score = connectivity_from * connectivity_to
+
+                # Mask out already-selected indices
+                bridge_score[selected_mask] = -float('inf')
+
+                # Select top-k remaining (highest connectivity = best bridges)
+                k = min(bridge_budget, (~selected_mask).sum().item())
+                if k > 0:
+                    _, bridge_indices = torch.topk(bridge_score, k=k, largest=True)
                 else:
-                    # Truncate
-                    frc_scores = frc_scores[:cache_len]
+                    bridge_indices = torch.tensor([], dtype=torch.long, device=device)
 
-            # Mask out already-selected indices
-            candidate_frc = frc_scores.clone()
-            candidate_frc[selected_mask] = float('inf')
+            elif importance_scores is not None:
+                # O(N) median-based bridge selection (production mode)
+                # Bridge concept: positions with MODERATE importance connect high-importance contexts
+                # High importance = keywords (already selected)
+                # Low importance = noise (should evict)
+                # Medium importance = transitions/connectors (bridges!)
 
-            # Select bottom-k remaining (LOWEST FRC = bridges)
-            k = min(bridge_budget, (~selected_mask).sum().item())
-            if k > 0:
-                _, bridge_indices = torch.topk(
-                    candidate_frc, k=k, largest=False  # LOWEST!
-                )
+                # Get valid candidates (exclude already selected)
+                valid_mask = ~selected_mask
+                valid_scores = importance_scores[valid_mask]
+
+                if len(valid_scores) > 0:
+                    # Find median importance among candidates
+                    median_importance = valid_scores.median()
+
+                    # Bridge score: closer to median = better bridge
+                    # Use negative distance so we can use topk
+                    distance_from_median = torch.abs(importance_scores - median_importance)
+                    bridge_score = -distance_from_median
+                    bridge_score[selected_mask] = -float('inf')
+
+                    # Select top-k closest to median
+                    k = min(bridge_budget, (~selected_mask).sum().item())
+                    if k > 0:
+                        _, bridge_indices = torch.topk(bridge_score, k=k, largest=True)
+                    else:
+                        bridge_indices = torch.tensor([], dtype=torch.long, device=device)
+                else:
+                    bridge_indices = torch.tensor([], dtype=torch.long, device=device)
+
             else:
-                bridge_indices = torch.tensor([], dtype=torch.long, device=device)
+                # Fallback: select from middle of sequence (should rarely happen)
+                remaining_indices = torch.where(~selected_mask)[0]
+                k = min(bridge_budget, len(remaining_indices))
+                if k > 0:
+                    # Select middle positions for better coverage
+                    start_idx = len(remaining_indices) // 3
+                    end_idx = start_idx + k
+                    bridge_indices = remaining_indices[start_idx:min(end_idx, len(remaining_indices))]
+                else:
+                    bridge_indices = torch.tensor([], dtype=torch.long, device=device)
         else:
-            # No FRC available, select randomly from remaining
-            remaining_indices = torch.where(~selected_mask)[0]
-            k = min(bridge_budget, len(remaining_indices))
-            if k > 0:
-                perm = torch.randperm(len(remaining_indices), device=device)[:k]
-                bridge_indices = remaining_indices[perm]
-            else:
-                bridge_indices = torch.tensor([], dtype=torch.long, device=device)
+            bridge_indices = torch.tensor([], dtype=torch.long, device=device)
 
         # Combine all selected indices
         keep_indices = torch.cat([
