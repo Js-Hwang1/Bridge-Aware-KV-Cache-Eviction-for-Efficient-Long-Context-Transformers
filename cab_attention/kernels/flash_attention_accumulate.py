@@ -108,7 +108,20 @@ def _flash_attention_fwd_kernel(
 
         # Online softmax trick (Flash Attention algorithm)
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+
+        # CRITICAL: Handle numerical stability for masked rows
+        # If all values in a row are -inf (fully masked), m_ij = -inf
+        # Then exp(qk - m_ij) = exp(-inf - (-inf)) = exp(nan) = nan
+        # This causes NaN in cumulative scores, leading to gibberish outputs
+        # Fix: Replace -inf with 0 for fully masked rows to get exp(-inf - 0) = 0
+        all_masked = (m_ij == float('-inf'))
+        m_ij = tl.where(all_masked, 0.0, m_ij)
+
         p = tl.exp(qk - m_ij[:, None])
+
+        # Zero out probabilities for fully masked rows (safety)
+        p = tl.where(all_masked[:, None], 0.0, p)
+
         l_ij = tl.sum(p, axis=1)
 
         # Update running statistics
