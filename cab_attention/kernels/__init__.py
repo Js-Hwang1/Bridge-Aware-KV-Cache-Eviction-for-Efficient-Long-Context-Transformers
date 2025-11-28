@@ -1,8 +1,11 @@
 """
-Triton/CUDA kernels for CAB-Attention
+Triton kernels for efficient CAB attention operations.
 """
 
-from .coarsening import coarsen_qk_max_l2
-from .frc_kernel import compute_block_frc
+from .frc_triton import compute_frc, compute_frc_triton, compute_frc_pytorch
 
-__all__ = ["coarsen_qk_max_l2", "compute_block_frc"]
+__all__ = [
+    "compute_frc",
+    "compute_frc_triton",
+    "compute_frc_pytorch",
+]
