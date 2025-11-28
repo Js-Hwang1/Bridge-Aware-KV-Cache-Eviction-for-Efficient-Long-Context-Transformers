@@ -192,11 +192,16 @@ class ModelWrapper:
         self.tokenizer = None
         self._loaded = False
     
-    def load(self) -> None:
-        """Load model and tokenizer."""
+    def load(self, force_eager_attention: bool = False) -> None:
+        """
+        Load model and tokenizer.
+
+        Args:
+            force_eager_attention: Force eager attention implementation (needed for CAB/H2O to capture attention weights)
+        """
         if self._loaded:
             return
-        
+
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError:
@@ -229,7 +234,10 @@ class ModelWrapper:
         }
         
         # Try to use optimized attention implementations
-        if self.config.use_flash_attention:
+        # NOTE: CAB and H2O require eager attention to capture attention weights
+        if force_eager_attention:
+            logger.info("Using eager attention (required for CAB/H2O to capture attention weights)")
+        elif self.config.use_flash_attention:
             try:
                 import flash_attn
                 model_kwargs['attn_implementation'] = 'flash_attention_2'
@@ -936,10 +944,12 @@ class BenchmarkRunner:
         logger.info(f"Datasets: {self.config.datasets}")
         logger.info(f"Methods: {self.config.methods}")
         logger.info(f"Sparsity levels: {self.config.sparsity_levels}")
-        
+
         # Load model
-        self.model_wrapper.load()
-        
+        # Force eager attention if using CAB or H2O (they need attention weights)
+        needs_attention_weights = any(method in ['cab', 'h2o'] for method in self.config.methods)
+        self.model_wrapper.load(force_eager_attention=needs_attention_weights)
+
         # Run for each dataset
         all_results = {}
         
