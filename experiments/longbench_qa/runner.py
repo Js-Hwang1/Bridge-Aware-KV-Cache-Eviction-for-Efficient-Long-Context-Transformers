@@ -336,24 +336,14 @@ class ModelWrapper:
 
         max_new_tokens = max_new_tokens or self.config.max_new_tokens
 
-        # Calculate context budget
-        # First, estimate prompt overhead (template + question) without context
-        template_prompt = self._format_prompt("", question)
-        template_tokens = len(self.tokenizer.encode(template_prompt, add_special_tokens=True))
+        # Format prompt with FULL context (no truncation for fair benchmarking)
+        prompt = self._format_prompt(context, question, max_context_tokens=None)
 
-        # Available tokens for context
-        max_input_tokens = self.config.max_length - max_new_tokens
-        max_context_tokens = max_input_tokens - template_tokens - 50  # -50 for safety margin
-
-        # Format prompt with truncated context
-        prompt = self._format_prompt(context, question, max_context_tokens=max_context_tokens)
-
-        # Tokenize (should not need truncation now, but keep as safety)
+        # Tokenize with FULL context (truncation=False for legitimate benchmarking)
         inputs = self.tokenizer(
             prompt,
             return_tensors='pt',
-            truncation=True,
-            max_length=max_input_tokens,
+            truncation=False,  # No truncation - use full context
         )
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         
