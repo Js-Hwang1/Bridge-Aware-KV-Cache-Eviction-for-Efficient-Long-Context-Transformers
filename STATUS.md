@@ -1,8 +1,8 @@
 # CAB (Curvature-Aware Block-Sparse Attention) - Implementation Status
 
 **Last Updated:** 2025-11-28
-**Version:** Production (O(N) complexity)
-**Status:** ✅ Ready for ICML benchmarking
+**Version:** CAB V5 + Flash Attention Integration
+**Status:** 🔧 Debugging LongBench QA Performance
 
 ---
 
@@ -143,30 +143,59 @@ CAB Cache:
 
 ## Fixes Applied
 
-### Fix 1: Triton Kernel `continue` Statement
+### CAB Cache Fixes (V1-V4)
+
+#### Fix 1: Triton Kernel `continue` Statement
 - **Issue:** Triton JIT doesn't support `continue`
 - **Solution:** Removed (unnecessary - multiply by 0 instead)
 - **File:** `cab_attention/kernels/frc_triton.py`
 
-### Fix 2: Eviction Policy Length Mismatch
+#### Fix 2: Eviction Policy Length Mismatch
 - **Issue:** Importance/FRC scores could have stale lengths
 - **Solution:** Added length validation and padding
 - **File:** `cab_attention/eviction/policy.py`
 
-### Fix 3: Multi-Layer Async Update Index Error
+#### Fix 3: Multi-Layer Async Update Index Error
 - **Issue:** Different layers had different cache sizes during eviction
 - **Solution:** Use minimum cache length across all layers
 - **Files:** `cab_attention/cache/cab_cache.py`, `h2o_cache.py`
 
-### Fix 4: Tracker Index Validation
+#### Fix 4: Tracker Index Validation
 - **Issue:** Prune indices could exceed tracker size
 - **Solution:** Filter indices before indexing
 - **Files:** `cab_attention/scoring/importance.py`, `frc.py`
 
-### Fix 5: Eager Attention for CAB/H2O
+#### Fix 5: Eager Attention for CAB/H2O
 - **Issue:** SDPA doesn't support capturing attention weights
 - **Solution:** Force eager attention when using CAB/H2O
 - **File:** `experiments/longbench_qa/runner.py`
+
+### Flash Attention Integration Fixes (V5 - 2025-11-28)
+
+#### Fix 6: Qwen2 Attribute Compatibility
+- **Issue:** Qwen2Attention uses `config.num_attention_heads` instead of `num_heads`
+- **Solution:** Pull attributes from config during monkey-patching
+- **Commit:** `050b694`, `2093efa`
+- **File:** `cab_attention/kernels/flash_attention_accumulate.py`
+
+#### Fix 7: Tensor Contiguity for Triton
+- **Issue:** `transpose()` creates non-contiguous views, Triton requires contiguous memory
+- **Solution:** Add `.contiguous()` after transpose operations
+- **Commit:** `2b4a1f8`
+- **File:** `cab_attention/kernels/flash_attention_accumulate.py`
+
+#### Fix 8: KV Cache Dimension Support in Host Code
+- **Issue:** During generation, N_q != N_k (query=1, keys=cache_len)
+- **Solution:** Size cumulative_scores to N_k, extend when cache grows
+- **Commit:** `079be41`
+- **File:** `cab_attention/kernels/flash_attention_accumulate.py`
+
+#### Fix 9: KV Cache Support in Triton Kernel
+- **Issue:** Triton kernel used single `N` parameter, caused illegal memory access
+- **Solution:** Split into `N_q` and `N_k`, use appropriately throughout kernel
+- **Commit:** `e23b396`
+- **File:** `cab_attention/kernels/flash_attention_accumulate.py`
+- **Status:** ✅ VERIFIED - Flash Attention working with generation
 
 ---
 
@@ -182,10 +211,37 @@ CAB Cache:
 ✓ H2O Cache (baseline)
 ```
 
-### Integration Tests: 🔄 In Progress
-- NarrativeQA benchmark running on server
-- Expected runtime: ~30 minutes for 200 samples
-- Monitoring for completion
+### Flash Attention Tests: ✅ PASSING (2025-11-28)
+```
+✓ Monkey-patching successful (28 layers patched)
+✓ Generation works without CUDA errors
+✓ Cumulative scores accumulating correctly
+✓ KV caching working (N_q != N_k supported)
+✓ Memory usage: 14.2 GB (reasonable)
+```
+
+### LongBench QA Tests: 🔧 FIXED - Testing in Progress
+
+**Issue:** Dense baseline F1 = 0.0182 (expected ~0.20-0.30)
+
+**Root Cause Identified:**
+- NarrativeQA contexts are very long (127K-134K characters, ~25K-30K tokens)
+- Tokenizer was truncating the FULL prompt (context + question + instructions) to 3840 tokens
+- This cut off the question and instructions entirely
+- Model only saw partial context with no question → generated random fragments ("of", "long they")
+
+**Fix Applied (2025-11-28):**
+- Modified `_format_prompt()` to accept `max_context_tokens` parameter
+- Modified `generate_response()` to:
+  1. Calculate prompt overhead (template + question tokens)
+  2. Calculate available context tokens: `max_input_tokens - template_tokens - 50` (safety margin)
+  3. Truncate context BEFORE building prompt (preserves question/instructions)
+  4. Tokenize the complete prompt (which now fits within limits)
+- File: [experiments/longbench_qa/runner.py](experiments/longbench_qa/runner.py#L326-L336)
+
+**Expected Results:**
+- Dense baseline should now achieve F1 ~0.20-0.30 (similar to published LongBench results)
+- All sparse methods should also benefit from correct prompting
 
 ---
 

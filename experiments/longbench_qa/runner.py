@@ -320,18 +320,27 @@ class ModelWrapper:
         """
         if not self._loaded:
             self.load()
-        
+
         max_new_tokens = max_new_tokens or self.config.max_new_tokens
-        
-        # Format prompt
-        prompt = self._format_prompt(context, question)
-        
-        # Tokenize
+
+        # Calculate context budget
+        # First, estimate prompt overhead (template + question) without context
+        template_prompt = self._format_prompt("", question)
+        template_tokens = len(self.tokenizer.encode(template_prompt, add_special_tokens=True))
+
+        # Available tokens for context
+        max_input_tokens = self.config.max_length - max_new_tokens
+        max_context_tokens = max_input_tokens - template_tokens - 50  # -50 for safety margin
+
+        # Format prompt with truncated context
+        prompt = self._format_prompt(context, question, max_context_tokens=max_context_tokens)
+
+        # Tokenize (should not need truncation now, but keep as safety)
         inputs = self.tokenizer(
             prompt,
             return_tensors='pt',
             truncation=True,
-            max_length=self.config.max_length - max_new_tokens,
+            max_length=max_input_tokens,
         )
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         
@@ -385,10 +394,29 @@ class ModelWrapper:
         
         return prediction.strip(), diagnostics
     
-    def _format_prompt(self, context: str, question: str) -> str:
-        """Format context and question into prompt."""
+    def _format_prompt(self, context: str, question: str, max_context_tokens: Optional[int] = None) -> str:
+        """
+        Format context and question into prompt.
+
+        Args:
+            context: Long context text
+            question: Question to answer
+            max_context_tokens: Maximum tokens for context (if None, no truncation)
+
+        Returns:
+            Formatted prompt with potentially truncated context
+        """
         model_name = self.config.name.lower()
-        
+
+        # Truncate context if max_context_tokens is specified
+        if max_context_tokens is not None:
+            # Tokenize context and truncate from the END (keep beginning)
+            context_tokens = self.tokenizer.encode(context, add_special_tokens=False)
+            if len(context_tokens) > max_context_tokens:
+                # Keep the first max_context_tokens
+                context_tokens = context_tokens[:max_context_tokens]
+                context = self.tokenizer.decode(context_tokens, skip_special_tokens=True)
+
         # Use instruction format for instruct-tuned models
         if 'instruct' in model_name or 'chat' in model_name:
             if 'mistral' in model_name:
@@ -441,7 +469,7 @@ Answer the question based on the context. Output ONLY the answer.
 Question: {question}
 
 Answer:"""
-        
+
         return prompt
 
     def _get_flash_cumulative_scores(self) -> Optional[torch.Tensor]:
