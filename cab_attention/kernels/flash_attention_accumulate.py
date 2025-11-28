@@ -391,9 +391,10 @@ def _create_flash_attention_forward(original_module, layer_idx: int):
 
         # Update KV cache if using past_key_values
         if past_key_values is not None:
-            # Update cache (will expand key/value states)
+            # Update cache with position info for correct RoPE after eviction
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(
-                key_states, value_states, layer_idx, cache_kwargs=None
+                key_states, value_states, layer_idx, cache_kwargs=cache_kwargs
             )
 
         # Handle GQA (Grouped Query Attention) by repeating K/V heads
