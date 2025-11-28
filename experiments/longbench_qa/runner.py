@@ -722,17 +722,13 @@ Answer:"""
         elif method == "cab":
             # CAB: Three-component eviction (Local + Bridges + Importance)
             if cumulative_attention is not None and len(cumulative_attention) >= N:
-                from cab_attention.eviction import ThreeComponentEvictionPolicy
-                from cab_attention.config import CABConfig
+                from cab_attention.eviction import ThreeComponentEvictionPolicy, EvictionConfig
 
                 # Create eviction policy (same configuration as CABCache)
-                config = CABConfig(
-                    max_cache_size=N,
-                    sparsity=1.0 - keep_ratio,
+                config = EvictionConfig(
                     local_ratio=0.3,
                     bridge_ratio=0.2,
                     importance_ratio=0.5,
-                    device=device,
                 )
                 policy = ThreeComponentEvictionPolicy(config)
 
