@@ -442,9 +442,9 @@ Answer:"""
         - CAB V5: Three-component eviction with CABCache (Ours - NEW)
         - CAB V4: Legacy hybrid magnitude + uniqueness
         """
-        # Use CAB V5 with the new CABCache
-        if method == "cab":
-            return self._generate_with_cab(inputs, max_new_tokens, sparsity)
+        # CAB handled inline (like H2O) - no separate integration needed
+        # if method == "cab":
+        #     return self._generate_with_cab(inputs, max_new_tokens, sparsity)
         
         device = inputs['input_ids'].device
         batch_size = inputs['input_ids'].shape[0]
@@ -458,27 +458,28 @@ Answer:"""
             has_dynamic_cache = False
             DynamicCache = None
         
-        # H2O: Track cumulative attention scores (faithful to paper)
+        # H2O/CAB: Track cumulative attention scores (faithful to paper)
         # OPTIMIZATION: Only request attention when pruning (every 5 steps)
         # This is ~5x faster while remaining faithful to the algorithm
         cumulative_attention = None  # Will be [cache_len] tensor
         is_h2o = (method == "h2o")
+        is_cab = (method == "cab")
         
         # Initial forward pass to get KV cache
-        # For H2O: Need attention on first pass to initialize cumulative scores
+        # For H2O/CAB: Need attention on first pass to initialize cumulative scores
         with torch.no_grad():
             outputs = self.model(
                 **inputs,
                 use_cache=True,
                 return_dict=True,
-                output_attentions=is_h2o,  # Only for initial pruning
+                output_attentions=(is_h2o or is_cab),  # For importance tracking
             )
-        
+
         past_key_values = outputs.past_key_values
         next_token_logits = outputs.logits[:, -1, :]
-        
-        # H2O: Initialize cumulative attention from first pass
-        if is_h2o and outputs.attentions is not None:
+
+        # H2O/CAB: Initialize cumulative attention from first pass
+        if (is_h2o or is_cab) and outputs.attentions is not None:
             # attentions: tuple of [B, H, seq_len, seq_len] per layer
             # Sum across layers, batch, heads, query positions to get per-key score
             attn_stack = torch.stack(outputs.attentions, dim=0)  # [L, B, H, Q, K]
@@ -508,8 +509,8 @@ Answer:"""
             
             # OPTIMIZATION: Only request attention on pruning steps
             will_prune = ((step + 1) % 5 == 0)
-            need_attention = is_h2o and will_prune
-            
+            need_attention = (is_h2o or is_cab) and will_prune
+
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=next_token,
@@ -518,11 +519,11 @@ Answer:"""
                     return_dict=True,
                     output_attentions=need_attention,
                 )
-            
+
             past_key_values = outputs.past_key_values
             next_token_logits = outputs.logits[:, -1, :]
-            
-            # H2O: Accumulate attention scores (only on pruning steps)
+
+            # H2O/CAB: Accumulate attention scores (only on pruning steps)
             if need_attention and outputs.attentions is not None:
                 attn_stack = torch.stack(outputs.attentions, dim=0)  # [L, B, H, 1, K]
                 new_scores = attn_stack.sum(dim=(0, 1, 2, 3))  # [K]
@@ -716,7 +717,39 @@ Answer:"""
             else:
                 # Fallback: keep most recent
                 keep_indices = torch.arange(N - num_keep, N, device=device)
-        
+
+        elif method == "cab":
+            # CAB: Three-component eviction (Local + Bridges + Importance)
+            if cumulative_attention is not None and len(cumulative_attention) >= N:
+                from cab_attention.eviction import ThreeComponentEvictionPolicy
+                from cab_attention.config import CABConfig
+
+                # Create eviction policy (same configuration as CABCache)
+                config = CABConfig(
+                    max_cache_size=N,
+                    sparsity=1.0 - keep_ratio,
+                    local_ratio=0.3,
+                    bridge_ratio=0.2,
+                    importance_ratio=0.5,
+                    device=device,
+                )
+                policy = ThreeComponentEvictionPolicy(config)
+
+                # Get importance scores
+                importance_scores = cumulative_attention[:N]
+
+                # Select indices using three-component policy (with O(N) median-based bridge selection)
+                keep_indices, diagnostics = policy.select_indices(
+                    cache_len=N,
+                    keep_size=num_keep,
+                    importance_scores=importance_scores,
+                    attention_matrix=None,  # Use O(N) heuristic, not O(N²) computation
+                    device=device,
+                )
+            else:
+                # Fallback: keep most recent (same as H2O)
+                keep_indices = torch.arange(N - num_keep, N, device=device)
+
         elif method == "streaming_llm":
             # StreamingLLM: Sinks + recent (exact algorithm)
             sink_size = 4
