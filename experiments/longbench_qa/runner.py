@@ -229,7 +229,16 @@ class ModelWrapper:
         }
         
         # Try to use optimized attention implementations
-        if self.config.use_flash_attention:
+        # NOTE: H2O requires output_attentions=True, which only works with 'eager'
+        # Check if any method requires attention outputs
+        needs_attention_output = any(
+            m in ['h2o'] for m in getattr(self, '_methods_needing_attention', [])
+        )
+        
+        if needs_attention_output:
+            model_kwargs['attn_implementation'] = 'eager'
+            logger.info("Using eager attention (required for H2O cumulative attention tracking)")
+        elif self.config.use_flash_attention:
             try:
                 import flash_attn
                 model_kwargs['attn_implementation'] = 'flash_attention_2'
@@ -920,6 +929,10 @@ class BenchmarkRunner:
         
         # Initialize model wrapper
         self.model_wrapper = ModelWrapper(config.model)
+        
+        # Tell model wrapper which methods need attention output
+        # H2O needs output_attentions=True for cumulative attention tracking
+        self.model_wrapper._methods_needing_attention = config.methods
         
         # Track results
         self.results: Dict[str, MethodResult] = {}
