@@ -271,20 +271,11 @@ class ModelWrapper:
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # Replace attention with Flash Attention if using CAB/H2O methods
-        # This provides 3-4x speedup and 50x memory reduction
-        if force_eager_attention:
-            try:
-                from cab_attention.kernels.flash_attention_accumulate import replace_attention_with_flash
-                logger.info("Replacing attention layers with Flash Attention + cumulative score tracking...")
-                self.model = replace_attention_with_flash(self.model)
-                self.use_flash_attention = True
-                logger.info("Flash Attention integration complete (3-4x faster, 50x less memory)")
-            except ImportError as e:
-                logger.warning(f"Flash Attention not available: {e}. Using eager attention (slower).")
-                self.use_flash_attention = False
-        else:
-            self.use_flash_attention = False
+        # TODO: Flash Attention integration disabled due to HuggingFace compatibility issues
+        # The FlashAttentionWithAccumulation wrapper needs to match HF's attention module signature
+        # For now, use eager attention with output_attentions=True (slower but functional)
+        # Future work: Properly hook into HF's attention computation for Flash Attention
+        self.use_flash_attention = False
 
         self.model.eval()
         self._loaded = True
