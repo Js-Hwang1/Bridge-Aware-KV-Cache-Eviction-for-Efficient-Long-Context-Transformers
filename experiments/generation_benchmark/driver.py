@@ -161,19 +161,19 @@ class GenerationBenchmark:
         """
         Load and prepare dataset samples.
 
-        Returns list of dicts with 'text' and 'tokens' keys.
+        Returns list of dicts with 'context_tokens', 'target_tokens', 'full_tokens' keys.
         """
         logger.info(f"Loading dataset: {dataset_name} ({num_samples} samples, {context_length} context)")
 
         if dataset_name == 'pg19':
             # PG-19: Long-form books
-            dataset = load_dataset('pg19', split='test', trust_remote_code=True)
+            dataset = load_dataset('pg19', split='test')
         elif dataset_name == 'wikitext':
-            # WikiText-103
-            dataset = load_dataset('wikitext', 'wikitext-103-v1', split='test', trust_remote_code=True)
+            # WikiText-103 - use validation split (longer docs)
+            dataset = load_dataset('wikitext', 'wikitext-103-v1', split='validation')
         elif dataset_name == 'arxiv':
             # arXiv papers (via RedPajama)
-            dataset = load_dataset('togethercomputer/RedPajama-Data-1T-Sample', split='train', trust_remote_code=True)
+            dataset = load_dataset('togethercomputer/RedPajama-Data-1T-Sample', split='train')
             dataset = dataset.filter(lambda x: x['meta']['redpajama_set_name'] == 'ArXiv')
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -181,35 +181,56 @@ class GenerationBenchmark:
         # Set seed for reproducibility
         rng = np.random.RandomState(seed)
 
-        # Sample indices
-        total_size = len(dataset)
-        sample_indices = rng.choice(total_size, size=min(num_samples * 10, total_size), replace=False)
+        # Target length for full sequence (context + generation)
+        target_length = context_length + 128  # Reduced from 256 for robustness
+        min_length = target_length
 
-        # Process samples
+        # Concatenate all text into a single long sequence
+        logger.info("Concatenating dataset texts...")
+        all_text = ""
+        dataset_size = min(1000, len(dataset))  # Limit to first 1000 docs for speed
+        for idx in range(dataset_size):
+            text = dataset[idx]['text'] if 'text' in dataset[idx] else dataset[idx].get('content', '')
+            # Skip empty or very short entries
+            if text and len(text.strip()) > 100:
+                all_text += text + "\n\n"
+
+        # Tokenize the concatenated text
+        logger.info(f"Tokenizing {len(all_text)} characters...")
+        all_tokens = self.tokenizer.encode(all_text, add_special_tokens=False)
+        logger.info(f"Total tokens: {len(all_tokens)}")
+
+        # Extract random windows
         samples = []
-        for idx in sample_indices:
-            text = dataset[int(idx)]['text'] if 'text' in dataset[int(idx)] else dataset[int(idx)]['content']
+        max_attempts = num_samples * 10
+        for attempt in range(max_attempts):
+            if len(samples) >= num_samples:
+                break
 
-            # Tokenize
-            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            # Random start position (ensure enough space for full sequence)
+            if len(all_tokens) < min_length:
+                logger.warning(f"Dataset too short ({len(all_tokens)} tokens < {min_length} required)")
+                break
 
-            # Keep only if long enough for context
-            if len(tokens) >= context_length + 256:  # +256 for generation
-                # Extract context window
-                start_idx = rng.randint(0, len(tokens) - context_length - 256)
-                context_tokens = tokens[start_idx:start_idx + context_length]
-                target_tokens = tokens[start_idx + context_length:start_idx + context_length + 256]
+            start_idx = rng.randint(0, len(all_tokens) - min_length)
 
+            # Extract context and target
+            context_tokens = all_tokens[start_idx:start_idx + context_length]
+            target_tokens = all_tokens[start_idx + context_length:start_idx + target_length]
+
+            # Validate
+            if len(context_tokens) == context_length and len(target_tokens) > 0:
                 samples.append({
                     'context_tokens': context_tokens,
                     'target_tokens': target_tokens,
                     'full_tokens': context_tokens + target_tokens,
                 })
 
-                if len(samples) >= num_samples:
-                    break
+        if len(samples) == 0:
+            raise ValueError(f"Could not extract any samples from {dataset_name}. "
+                           f"Dataset may be too short or context_length too large.")
 
-        logger.info(f"Loaded {len(samples)} samples")
+        logger.info(f"Loaded {len(samples)} samples (target: {num_samples})")
         return samples
 
     def _reset_flash_cumulative_scores(self):
